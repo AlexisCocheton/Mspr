@@ -237,11 +237,6 @@ elif page == "🔍 Prédiction en temps réel":
             features = np.array([[
                 temperature, vibration, courant, pression, vitesse,
                 age, h_maint,
-                temperature, 0.0,
-                vibration,   0.0,
-                courant,     0.0,
-                pression,    0.0,
-                vitesse,     0.0,
                 type_enc, usine_enc,
             ]])
 
