@@ -126,37 +126,44 @@ def simuler_capteurs(score_degradation, type_machine, date, climat,
 
     if en_panne:
         # ── Corrélation 2 : machine EN PANNE ─────────────────────────────────
-        # La panne est une CONTINUATION de la dégradation, légèrement au-delà du seuil,
-        # avec beaucoup de bruit (comportement erratique).
-        # Objectif : chevauchement intentionnel avec l'état "critique" pour rendre
-        # la classification difficile et réaliste (F1 cible : 0.75-0.92).
+        # Comportement erratique : signal fort mais bruité, chevauchement
+        # intentionnel avec l'état "critique" pour un F1 cible réaliste.
         score_eff  = min(1.0, score_degradation + np.random.uniform(0.0, 0.12))
         drift_eff  = min(0.50, drift_maint       + np.random.uniform(0.0, 0.18))
-        facteur    = 1 + score_eff * 0.45 + drift_eff
+        facteur    = 1 + score_eff * 0.30 + drift_eff   # amplitude réduite : 0.45→0.30
 
-        temperature_C  = cfg["temp_base"] * facteur + delta_temp_ambiant + np.random.normal(0, 9)
-        vibration_mm_s = (cfg["vib_base"] * facteur * np.random.uniform(1.05, 1.25)
-                          + np.random.normal(0, 0.50))
-        courant_A      = cfg["courant_base"] * facteur + np.random.normal(0, 4.0)
-        pression_bar   = round(max(1.0, 6.5 - score_eff * 1.55 - drift_eff * 0.70
-                                   + np.random.normal(0, 0.45)), 2)
-        vitesse_tr_min = round(max(0, 1500 - score_eff * 520 - drift_eff * 180
-                                   + np.random.normal(0, 85)), 0)
+        temperature_C  = cfg["temp_base"] * facteur + delta_temp_ambiant + np.random.normal(0, 16)
+        vibration_mm_s = (cfg["vib_base"] * facteur * np.random.uniform(1.05, 1.20)
+                          + np.random.normal(0, 0.9))
+        courant_A      = cfg["courant_base"] * facteur + np.random.normal(0, 7.0)
+        pression_bar   = round(max(1.0, 6.5 - score_eff * 1.10 - drift_eff * 0.55
+                                   + np.random.normal(0, 0.75)), 2)
+        vitesse_tr_min = round(max(0, 1500 - score_eff * 380 - drift_eff * 140
+                                   + np.random.normal(0, 140)), 0)
 
     else:
         # ── Corrélations 1 + 4 : dégradation progressive ─────────────────────
-        facteur = 1 + score_degradation * 0.45 + drift_maint
+        facteur = 1 + score_degradation * 0.30 + drift_maint   # amplitude réduite : 0.45→0.30
 
         if mode_critique:
-            facteur *= 1.10  # légère surchauffe dans les 48h avant panne
+            facteur *= 1.07  # surchauffe modérée dans les 48h avant panne
 
-        temperature_C  = cfg["temp_base"] * facteur + delta_temp_ambiant + np.random.normal(0, 4)
-        vibration_mm_s = cfg["vib_base"]  * facteur + drift_maint * 0.5 + np.random.normal(0, 0.25)
-        courant_A      = cfg["courant_base"] * facteur + np.random.normal(0, 1.5)
-        pression_bar   = round(6.5 - score_degradation * 1.2 - drift_maint * 0.5
-                               + np.random.normal(0, 0.2), 2)
-        vitesse_tr_min = round(max(100, 1500 - score_degradation * 400
-                                   - drift_maint * 100 + np.random.normal(0, 55)), 0)
+        # Bruit industriel réaliste : interférences, vibrations parasites, etc.
+        noise_factor = 1 + np.random.normal(0, 0.04)   # ±4 % bruit multiplicatif
+
+        temperature_C  = cfg["temp_base"] * facteur * noise_factor + delta_temp_ambiant + np.random.normal(0, 10)
+        vibration_mm_s = cfg["vib_base"]  * facteur * noise_factor + drift_maint * 0.5 + np.random.normal(0, 0.55)
+        courant_A      = cfg["courant_base"] * facteur * noise_factor + np.random.normal(0, 3.5)
+        pression_bar   = round(6.5 - score_degradation * 0.9 - drift_maint * 0.4
+                               + np.random.normal(0, 0.45), 2)
+        vitesse_tr_min = round(max(100, 1500 - score_degradation * 300
+                                   - drift_maint * 80 + np.random.normal(0, 90)), 0)
+
+        # Pics capteurs aléatoires (1% de chance) : bruit industriel ponctuel
+        if np.random.random() < 0.01:
+            temperature_C  += np.random.uniform(15, 35)
+        if np.random.random() < 0.01:
+            vibration_mm_s += np.random.uniform(0.5, 1.5)
 
     return {
         "temperature_C":   round(temperature_C, 1),
