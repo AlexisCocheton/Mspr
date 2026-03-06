@@ -2,17 +2,20 @@
 API REST pour la solution de maintenance prédictive MECHA.
 
 Expose les modèles ML via des endpoints FastAPI :
-- POST /predict/panne      : prédit si la machine est en panne (en_panne)
-- POST /predict/panne24h   : prédit si une panne survient dans les 24 h
-- POST /predict/rul        : prédit le temps restant avant défaillance (RUL)
-- GET  /health             : état de l'API
-- GET  /model/info         : métriques d'entraînement
+- POST /predict/panne        : prédit si la machine est en panne (en_panne)
+- POST /predict/panne24h     : prédit si une panne survient dans les 24 h
+- POST /predict/rul          : prédit le temps restant avant défaillance (RUL)
+- POST /predict/anomalie     : détecte un comportement capteur atypique (Isolation Forest)
+- POST /predict/panne/explain: explique les facteurs de la prédiction panne (SHAP)
+- GET  /health               : état de l'API
+- GET  /model/info           : métriques d'entraînement
 """
 
 import json
 import numpy as np
 import joblib
 from pathlib import Path
+from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -22,7 +25,7 @@ MODELS_DIR = BASE_DIR / "models"
 app = FastAPI(
     title="MECHA - API Maintenance Prédictive",
     description="API de prédiction de pannes sur le dataset unifié MECHA",
-    version="2.0.0",
+    version="3.0.0",
 )
 
 # ---------------------------------------------------------------------------
@@ -35,35 +38,21 @@ models = {}
 def load_models():
     global models
 
-    # Classificateur : en_panne
     for fname, key in [
         ("random_forest_classifier_mecha.joblib",     "clf_panne"),
         ("scaler_mecha.joblib",                        "scaler_panne"),
         ("feature_names_mecha.joblib",                 "feature_names"),
-    ]:
-        p = MODELS_DIR / fname
-        if p.exists():
-            models[key] = joblib.load(p)
-
-    # Classificateur : panne_dans_24h
-    for fname, key in [
         ("random_forest_classifier_mecha_24h.joblib", "clf_24h"),
         ("scaler_mecha_24h.joblib",                    "scaler_24h"),
-    ]:
-        p = MODELS_DIR / fname
-        if p.exists():
-            models[key] = joblib.load(p)
-
-    # Régresseur RUL
-    for fname, key in [
         ("random_forest_regressor_mecha.joblib",      "reg_rul"),
         ("scaler_rul_mecha.joblib",                    "scaler_rul"),
+        ("isolation_forest_mecha.joblib",              "iso_forest"),
+        ("scaler_anomaly_mecha.joblib",                "scaler_anomaly"),
     ]:
         p = MODELS_DIR / fname
         if p.exists():
             models[key] = joblib.load(p)
 
-    # Mappings catégoriels
     maps_path = BASE_DIR / "data" / "processed" / "category_maps.json"
     if maps_path.exists():
         with open(maps_path, encoding="utf-8") as f:
@@ -81,17 +70,19 @@ async def startup_event():
 
 class MechaPredictionRequest(BaseModel):
     """Données capteurs d'une machine MECHA."""
-    temperature_C:        float = Field(..., description="Température machine (°C)")
-    vibration_mm_s:       float = Field(..., description="Vibration (mm/s)")
-    courant_A:            float = Field(..., description="Courant électrique (A)")
-    pression_bar:         float = Field(..., description="Pression hydraulique (bar)")
-    vitesse_tr_min:       float = Field(..., description="Vitesse de rotation (tr/min)")
-    age_machine_h:        int   = Field(..., description="Âge de la machine (heures)")
-    h_depuis_maintenance: int   = Field(..., description="Heures depuis la dernière maintenance")
-    type_machine:         str   = Field("CNC-Fraisage",
-                                        description="Type : CNC-Fraisage, CNC-Tournage, Découpe-Laser, Centre-Usinage")
-    usine_id:             str   = Field("USN-FR-01",
-                                        description="Identifiant usine : USN-FR-01 … USN-ES-02")
+    temperature_C:        float = Field(..., ge=-20,    le=300,    description="Température machine (°C)")
+    vibration_mm_s:       float = Field(..., ge=0,      le=20,     description="Vibration (mm/s)")
+    courant_A:            float = Field(..., ge=0,      le=100,    description="Courant électrique (A)")
+    pression_bar:         float = Field(..., ge=0,      le=20,     description="Pression hydraulique (bar)")
+    vitesse_tr_min:       float = Field(..., ge=0,      le=3000,   description="Vitesse de rotation (tr/min)")
+    age_machine_h:        int   = Field(..., ge=0,      le=200000, description="Âge de la machine (heures)")
+    h_depuis_maintenance: int   = Field(..., ge=0,      le=10000,  description="Heures depuis la dernière maintenance")
+    type_machine: Literal["CNC-Fraisage", "CNC-Tournage", "Découpe-Laser", "Centre-Usinage"] = Field(
+        "CNC-Fraisage", description="Type de machine"
+    )
+    usine_id: Literal["USN-FR-01", "USN-FR-02", "USN-FR-03", "USN-ES-01", "USN-ES-02"] = Field(
+        "USN-FR-01", description="Identifiant usine"
+    )
 
     model_config = {"json_schema_extra": {"examples": [{
         "temperature_C": 72.0,
@@ -119,35 +110,50 @@ class RULResponse(BaseModel):
     recommendation:      str
 
 
+class AnomalyResponse(BaseModel):
+    is_anomaly:     bool  = Field(..., description="True si comportement atypique détecté")
+    anomaly_score:  float = Field(..., description="Score d'anomalie normalisé [0–1], 1 = très anormal")
+    risk_level:     str   = Field(..., description="normal / suspect / anomalie")
+    recommendation: str
+
+
+class FeatureContribution(BaseModel):
+    feature:      str
+    value:        float
+    contribution: float
+    direction:    str = Field(..., description="hausse_risque / baisse_risque")
+
+
+class ExplainResponse(BaseModel):
+    prediction:     int
+    probability:    float
+    risk_level:     str
+    recommendation: str
+    top_features:   list[FeatureContribution]
+
+
 # ---------------------------------------------------------------------------
-# Construction du vecteur de features
+# Utilitaires
 # ---------------------------------------------------------------------------
+
+FEATURE_NAMES = [
+    "temperature_C", "vibration_mm_s", "courant_A",
+    "pression_bar", "vitesse_tr_min",
+    "age_machine_h", "h_depuis_maintenance",
+    "type_machine_encoded", "usine_encoded",
+]
+
 
 def build_feature_vector(data: MechaPredictionRequest) -> np.ndarray:
-    """
-    Construit le vecteur de features dans le même ordre que FEATURE_COLS.
-    Les moyennes 24 h et écarts-types sont approchés par les valeurs instantanées
-    (pas d'historique disponible en prédiction ponctuelle).
-    """
-    maps = models.get("category_maps", {})
+    maps      = models.get("category_maps", {})
     type_enc  = maps.get("type_machine", {}).get(data.type_machine, 0)
     usine_enc = maps.get("usine_id",     {}).get(data.usine_id,     0)
-
-    features = np.array([[
-        # Capteurs instantanés
-        data.temperature_C,
-        data.vibration_mm_s,
-        data.courant_A,
-        data.pression_bar,
-        data.vitesse_tr_min,
-        # Contexte machine
-        data.age_machine_h,
-        data.h_depuis_maintenance,
-        # Catégorielles
-        type_enc,
-        usine_enc,
+    return np.array([[
+        data.temperature_C, data.vibration_mm_s, data.courant_A,
+        data.pression_bar,  data.vitesse_tr_min,
+        data.age_machine_h, data.h_depuis_maintenance,
+        type_enc, usine_enc,
     ]])
-    return features
 
 
 def get_risk_assessment(probability: float) -> tuple[str, str]:
@@ -247,6 +253,91 @@ async def predict_rul(data: MechaPredictionRequest):
         estimated_rul_hours=round(rul, 2),
         risk_level=risk,
         recommendation=reco,
+    )
+
+
+@app.post("/predict/anomalie", response_model=AnomalyResponse)
+async def predict_anomalie(data: MechaPredictionRequest):
+    """
+    Détecte un comportement capteur atypique via Isolation Forest.
+    Approche non supervisée — ne nécessite pas de labels de panne.
+    Complémentaire aux classifieurs supervisés.
+    """
+    if "iso_forest" not in models:
+        raise HTTPException(503, "Modèle Isolation Forest non chargé. Lancez model_training.py.")
+
+    features        = build_feature_vector(data)
+    features_scaled = models["scaler_anomaly"].transform(features)
+
+    pred  = models["iso_forest"].predict(features_scaled)[0]       # -1 = anomalie, +1 = normal
+    score = float(models["iso_forest"].score_samples(features_scaled)[0])
+
+    is_anomaly = pred == -1
+    # score_samples est négatif ; on normalise vers [0, 1] (1 = très anormal)
+    normalized = float(max(0.0, min(1.0, (-score - 0.3) / 0.4)))
+
+    if is_anomaly and normalized > 0.7:
+        risk = "anomalie"
+        reco = "Comportement capteur très inhabituel. Vérifier la machine immédiatement."
+    elif is_anomaly:
+        risk = "suspect"
+        reco = "Comportement légèrement atypique. Surveillance renforcée recommandée."
+    else:
+        risk = "normal"
+        reco = "Comportement capteur dans les normes habituelles."
+
+    return AnomalyResponse(
+        is_anomaly=is_anomaly,
+        anomaly_score=round(normalized, 4),
+        risk_level=risk,
+        recommendation=reco,
+    )
+
+
+@app.post("/predict/panne/explain", response_model=ExplainResponse)
+async def explain_panne(data: MechaPredictionRequest):
+    """
+    Explique les facteurs ayant conduit à la prédiction de panne.
+    Utilise SHAP TreeExplainer si disponible, sinon les importances globales RF.
+    """
+    if "clf_panne" not in models:
+        raise HTTPException(503, "Modèle en_panne non chargé. Lancez model_training.py.")
+
+    features        = build_feature_vector(data)
+    features_scaled = models["scaler_panne"].transform(features)
+    prediction      = int(models["clf_panne"].predict(features_scaled)[0])
+    probability     = float(models["clf_panne"].predict_proba(features_scaled)[0][1])
+    risk, reco      = get_risk_assessment(probability)
+
+    try:
+        import shap
+        explainer   = shap.TreeExplainer(models["clf_panne"])
+        shap_values = explainer.shap_values(features_scaled)
+        contribs    = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
+    except ImportError:
+        # Fallback : importances globales orientées selon la prédiction
+        sign    = 1 if prediction == 1 else -1
+        contribs = models["clf_panne"].feature_importances_ * sign
+
+    feat_values  = features[0]
+    top_indices  = np.argsort(np.abs(contribs))[::-1][:3]
+
+    top_features = [
+        FeatureContribution(
+            feature=FEATURE_NAMES[i],
+            value=round(float(feat_values[i]), 3),
+            contribution=round(float(contribs[i]), 4),
+            direction="hausse_risque" if contribs[i] > 0 else "baisse_risque",
+        )
+        for i in top_indices
+    ]
+
+    return ExplainResponse(
+        prediction=prediction,
+        probability=round(probability, 4),
+        risk_level=risk,
+        recommendation=reco,
+        top_features=top_features,
     )
 
 
