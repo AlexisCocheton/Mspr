@@ -231,10 +231,10 @@ def generer_machine(usine_id, machine_id_local, type_machine, dates, climat):
 
         score_deg = simuler_degradation(rul, h_depuis_maintenance)
         # Pendant une panne, le score de dégradation pointe vers la prochaine panne
-        # (lointaine) → score ≈ 0. On utilise un score entre 0.78 et 0.95 pour que
-        # les capteurs reflètent une machine clairement dégradée avec un léger chevauchement.
+        # (lointaine) → score ≈ 0. On force score=1.0 pour que les capteurs
+        # reflètent une machine en état de défaillance maximale.
         if en_panne:
-            score_pour_capteurs = np.random.uniform(0.78, 0.95)
+            score_pour_capteurs = 1.0
         else:
             score_pour_capteurs = score_deg
         capteurs  = simuler_capteurs(
