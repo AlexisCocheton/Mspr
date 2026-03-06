@@ -1,0 +1,15 @@
+{
+  "type_machine": {
+    "CNC-Fraisage": 0,
+    "CNC-Tournage": 1,
+    "Centre-Usinage": 2,
+    "Découpe-Laser": 3
+  },
+  "usine_id": {
+    "USN-ES-01": 0,
+    "USN-ES-02": 1,
+    "USN-FR-01": 2,
+    "USN-FR-02": 3,
+    "USN-FR-03": 4
+  }
+}
