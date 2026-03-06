@@ -150,13 +150,14 @@ def plot_feature_importance(model, tag: str):
 
 def train_classification(X, y, tag: str) -> dict:
     """Entraîne 6 classifieurs, sauvegarde tous les modèles + scaler."""
-    # Split avant rééquilibrage pour ne pas contaminer le test set
+    # Split avant rééquilibrage
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    # Rééquilibrage 50/50 sur le train uniquement
+    # Rééquilibrage 50/50 sur train ET test
     X_train, y_train = balance_dataset(X_train, y_train)
-    print(f"  Train rééquilibré : {len(y_train):,} observations (50% panne / 50% normal)")
+    X_test,  y_test  = balance_dataset(X_test,  y_test)
+    print(f"  Train : {len(y_train):,} obs (50/50) | Test : {len(y_test):,} obs (50/50)")
 
     scaler = StandardScaler()
     Xtr = scaler.fit_transform(X_train)
