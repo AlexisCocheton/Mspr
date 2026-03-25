@@ -1,7 +1,23 @@
-version: "3.8"
-
 services:
-  # API de prédiction
+
+  postgres:
+    image: postgres:15
+    container_name: mecha-postgres
+    environment:
+      POSTGRES_DB:       mecha
+      POSTGRES_USER:     mecha
+      POSTGRES_PASSWORD: mecha
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mecha -d mecha"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   api:
     build: .
     container_name: mecha-api
@@ -10,14 +26,18 @@ services:
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+    environment:
+      DATABASE_URL: "postgresql://mecha:mecha@mecha-postgres:5432/mecha"
     command: uvicorn src.api:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
 
-  # Dashboard Streamlit
   dashboard:
     build: .
     container_name: mecha-dashboard
@@ -26,6 +46,28 @@ services:
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+    environment:
+      DATABASE_URL: "postgresql://mecha:mecha@mecha-postgres:5432/mecha"
+      API_URL:      "http://mecha-api:8000"
     command: streamlit run src/dashboard.py --server.port 8501 --server.address 0.0.0.0
     depends_on:
       - api
+
+  simulator:
+    build: .
+    container_name: mecha-simulator
+    volumes:
+      - ./data:/app/data
+    environment:
+      API_URL:              "http://mecha-api:8000"
+      DATA_PATH:            "/app/data/raw/mecha_dataset_full.csv"
+      SIMULATOR_DELAY:      "2.0"
+      SIMULATOR_MAX_RETRY:  "30"
+    command: python src/sensor_simulator.py
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  postgres_data:
