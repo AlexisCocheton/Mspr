@@ -124,6 +124,8 @@ mspr/
 | `rul_heures` | float | h | Remaining Useful Life : heures restantes avant la prochaine panne |
 | `en_panne` | int | 0/1 | Indicateur de défaillance active à cet instant |
 | `etat_machine` | str | — | État qualitatif : normal / a_risque / critique / en_panne |
+| `nb_pannes_total` | int | — | Nombre total de pannes subies par la machine depuis sa mise en service |
+| `nb_maintenances_total` | int | — | Nombre total d'interventions de maintenance réalisées sur la machine |
 
 ### 3.2 Dataset préparé — `data/processed/mecha_unified_prepared.csv`
 

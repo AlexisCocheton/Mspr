@@ -43,7 +43,7 @@ ETAT_COLORS = {
 
 st.set_page_config(
     page_title="MECHA - Maintenance Prédictive",
-    page_icon="🏭",
+    page_icon=":factory:",
     layout="wide",
 )
 
@@ -80,19 +80,49 @@ def load_category_maps():
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def risk_label(p: float) -> str:
+    if p >= 0.8: return "CRITIQUE"
+    if p >= 0.5: return "ELEVÉ"
+    if p >= 0.3: return "MOYEN"
+    return "FAIBLE"
+
+RISK_COLORS = {
+    "FAIBLE":  "#28a745",
+    "MOYEN":   "#ffc107",
+    "ELEVÉ":   "#fd7e14",
+    "CRITIQUE":"#dc3545",
+}
+
+RISK_ACTIONS = {
+    "CRITIQUE": "Arrêt immédiat recommandé",
+    "ELEVÉ":    "Maintenance sous 24h",
+    "MOYEN":    "Surveillance renforcée",
+    "FAIBLE":   "Aucune action",
+}
+
+NUMERIC_FEATURES = [
+    "temperature_C", "vibration_mm_s", "courant_A",
+    "pression_bar", "vitesse_tr_min",
+    "age_machine_h", "h_depuis_maintenance",
+]
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
-st.sidebar.title("🏭 MECHA")
+st.sidebar.title("MECHA")
 st.sidebar.markdown("### Maintenance Prédictive IA")
 
 page = st.sidebar.radio(
     "Navigation",
     [
-        "📊 Vue d'ensemble",
-        "🔍 Prédiction en temps réel",
-        "📈 Analyse des capteurs",
-        "🤖 Performance des modèles",
+        "Vue d'ensemble",
+        "Prédiction en temps réel",
+        "Analyse des capteurs",
+        "Performance des modèles",
     ],
 )
 
@@ -101,7 +131,7 @@ page = st.sidebar.radio(
 # Page 1 : Vue d'ensemble
 # ---------------------------------------------------------------------------
 
-if page == "📊 Vue d'ensemble":
+if page == "Vue d'ensemble":
     st.title("Tableau de bord — Vue d'ensemble")
 
     df = load_data()
@@ -123,8 +153,10 @@ if page == "📊 Vue d'ensemble":
         st.metric("Taux en panne", f"{df['en_panne'].mean():.2%}")
     with col5:
         if results and "classification_panne_24h" in results:
-            f1 = results["classification_panne_24h"]["random_forest"]["f1_score"]
-            st.metric("F1 (panne 24h)", f"{f1:.2%}")
+            rf = results["classification_panne_24h"].get("random_forest", {})
+            f1 = rf.get("f1_score")
+            if f1 is not None:
+                st.metric("F1 (panne 24h)", f"{f1:.2%}")
 
     st.markdown("---")
 
@@ -193,7 +225,7 @@ if page == "📊 Vue d'ensemble":
 # Page 2 : Prédiction en temps réel
 # ---------------------------------------------------------------------------
 
-elif page == "🔍 Prédiction en temps réel":
+elif page == "Prédiction en temps réel":
     st.title("Prédiction de panne en temps réel")
 
     maps = load_category_maps()
@@ -253,7 +285,7 @@ elif page == "🔍 Prédiction en temps réel":
                 if proba >= 0.8:
                     risk, color = "CRITIQUE", "red"
                 elif proba >= 0.5:
-                    risk, color = "ÉLEVÉ",    "orange"
+                    risk, color = "ELEVÉ",    "orange"
                 elif proba >= 0.3:
                     risk, color = "MOYEN",    "yellow"
                 else:
@@ -262,7 +294,7 @@ elif page == "🔍 Prédiction en temps réel":
                 st.markdown("---")
                 c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.metric("Panne dans 24h", "⚠️ OUI" if pred == 1 else "✅ NON")
+                    st.metric("Panne dans 24h", "OUI" if pred == 1 else "NON")
                 with c2:
                     st.metric("Probabilité", f"{proba:.1%}")
                 with c3:
@@ -290,8 +322,7 @@ elif page == "🔍 Prédiction en temps réel":
                 if rul_path.exists():
                     reg      = joblib.load(rul_path)
                     rul_sc   = joblib.load(rul_sc_path)
-                    rul_feat = scaler.transform(features) if scaler_path == rul_sc_path \
-                               else rul_sc.transform(features)
+                    rul_feat = rul_sc.transform(features)
                     rul = max(0, float(reg.predict(rul_feat)[0]))
                     st.metric("RUL estimé", f"{rul:.0f} heures")
 
@@ -299,44 +330,41 @@ elif page == "🔍 Prédiction en temps réel":
     # Onglet 2 : prédiction par CSV
     # -----------------------------------------------------------------------
     with tab_csv:
-        st.subheader("Prédictions en batch via CSV")
+        st.subheader("Rapport de pannes potentielles via CSV")
 
-        FEATURE_COLS_CSV = [
-            "temperature_C", "vibration_mm_s", "courant_A",
-            "pression_bar", "vitesse_tr_min",
-            "age_machine_h", "h_depuis_maintenance",
-            "type_machine_encoded", "usine_encoded",
-        ]
+        SAMPLE_COLS = ["machine_id", "type_machine", "usine_id"] + NUMERIC_FEATURES
 
-        # --- Téléchargement d'un CSV exemple 50/50 ---
-        st.markdown("#### Télécharger un CSV exemple (50/50 panne / normal)")
+        # --- CSV exemple téléchargeable (format brut lisible) ---
+        st.markdown("#### Télécharger un CSV exemple")
         df_full = load_data()
         if df_full is not None:
-            pannes  = df_full[df_full["en_panne"] == 1][FEATURE_COLS_CSV + ["en_panne"]].sample(
+            pannes  = df_full[df_full["en_panne"] == 1][SAMPLE_COLS + ["en_panne"]].sample(
                 n=min(50, (df_full["en_panne"] == 1).sum()), random_state=42
             )
-            normaux = df_full[df_full["en_panne"] == 0][FEATURE_COLS_CSV + ["en_panne"]].sample(
+            normaux = df_full[df_full["en_panne"] == 0][SAMPLE_COLS + ["en_panne"]].sample(
                 n=50, random_state=42
             )
             sample_csv = pd.concat([pannes, normaux]).sample(frac=1, random_state=42).reset_index(drop=True)
-            st.download_button(
-                label="Télécharger le CSV exemple (100 lignes, 50/50)",
-                data=sample_csv.to_csv(index=False).encode("utf-8"),
-                file_name="mecha_sample_50_50.csv",
-                mime="text/csv",
-            )
-            with st.expander("Aperçu du CSV exemple"):
-                st.dataframe(sample_csv.head(10), use_container_width=True)
+            col_dl, col_prev = st.columns([1, 2])
+            with col_dl:
+                st.download_button(
+                    label="Télécharger le CSV exemple (100 lignes)",
+                    data=sample_csv.to_csv(index=False).encode("utf-8"),
+                    file_name="mecha_sample.csv",
+                    mime="text/csv",
+                )
+                st.caption(f"Colonnes obligatoires : `{', '.join(NUMERIC_FEATURES)}`")
+                st.caption(f"Colonnes optionnelles : `machine_id, type_machine, usine_id`")
+            with col_prev:
+                with st.expander("Aperçu"):
+                    st.dataframe(sample_csv.head(5), use_container_width=True)
         else:
             st.info("Données non disponibles pour générer le CSV exemple.")
 
         st.markdown("---")
 
-        # --- Upload et prédiction ---
-        st.markdown("#### Uploader un CSV pour prédictions en batch")
-        st.caption(f"Colonnes attendues : `{', '.join(FEATURE_COLS_CSV)}`")
-
-        uploaded = st.file_uploader("Choisir un fichier CSV", type=["csv"])
+        # --- Upload ---
+        uploaded = st.file_uploader("Uploader un CSV pour générer le rapport", type=["csv"])
 
         if uploaded is not None:
             clf_path    = MODELS_DIR / "random_forest_classifier_mecha_24h.joblib"
@@ -349,75 +377,173 @@ elif page == "🔍 Prédiction en temps réel":
             else:
                 try:
                     df_upload = pd.read_csv(uploaded)
-                    missing = [c for c in FEATURE_COLS_CSV if c not in df_upload.columns]
+
+                    # Vérification colonnes numériques obligatoires
+                    missing = [c for c in NUMERIC_FEATURES if c not in df_upload.columns]
                     if missing:
                         st.error(f"Colonnes manquantes dans le CSV : {missing}")
+                        st.stop()
+
+                    maps = load_category_maps()
+
+                    # Encodage des catégorielles (rétro-compatible)
+                    if "type_machine_encoded" in df_upload.columns:
+                        type_enc = df_upload["type_machine_encoded"].values
+                    elif "type_machine" in df_upload.columns:
+                        type_enc = df_upload["type_machine"].map(maps["type_machine"]).fillna(0).astype(int).values
                     else:
-                        clf    = joblib.load(clf_path)
-                        scaler = joblib.load(scaler_path)
-                        X      = df_upload[FEATURE_COLS_CSV].values
-                        X_sc   = scaler.transform(X)
-                        preds  = clf.predict(X_sc)
-                        probas = clf.predict_proba(X_sc)[:, 1]
+                        type_enc = np.zeros(len(df_upload), dtype=int)
 
-                        def risk_label(p):
-                            if p >= 0.8: return "CRITIQUE"
-                            if p >= 0.5: return "ÉLEVÉ"
-                            if p >= 0.3: return "MOYEN"
-                            return "FAIBLE"
+                    if "usine_encoded" in df_upload.columns:
+                        usine_enc = df_upload["usine_encoded"].values
+                    elif "usine_id" in df_upload.columns:
+                        usine_enc = df_upload["usine_id"].map(maps["usine_id"]).fillna(0).astype(int).values
+                    else:
+                        usine_enc = np.zeros(len(df_upload), dtype=int)
 
-                        df_result = df_upload.copy()
-                        df_result["panne_dans_24h"] = preds
-                        df_result["probabilite"]    = probas.round(4)
-                        df_result["risque"]         = [risk_label(p) for p in probas]
+                    X_num = df_upload[NUMERIC_FEATURES].values
+                    X = np.column_stack([X_num, type_enc, usine_enc])
 
-                        # RUL si disponible
-                        if rul_path.exists():
-                            reg    = joblib.load(rul_path)
-                            rul_sc = joblib.load(rul_sc_path)
-                            ruls   = reg.predict(rul_sc.transform(X))
-                            df_result["rul_estime_h"] = np.maximum(0, ruls).round(1)
+                    clf    = joblib.load(clf_path)
+                    scaler = joblib.load(scaler_path)
+                    X_sc   = scaler.transform(X)
+                    preds  = clf.predict(X_sc)
+                    probas = clf.predict_proba(X_sc)[:, 1]
 
-                        st.success(f"{len(df_result)} lignes traitées.")
+                    df_result = df_upload.copy()
+                    # Ajouter machine_id si absente
+                    if "machine_id" not in df_result.columns:
+                        df_result.insert(0, "machine_id", [f"Machine-{i+1}" for i in range(len(df_result))])
+                    df_result["panne_dans_24h"] = preds
+                    df_result["probabilite"]    = probas.round(4)
+                    df_result["risque"]         = [risk_label(p) for p in probas]
+                    df_result["action"]         = df_result["risque"].map(RISK_ACTIONS)
 
-                        # KPIs
-                        k1, k2, k3 = st.columns(3)
-                        k1.metric("Pannes prédites", int(preds.sum()))
-                        k2.metric("Taux de panne", f"{preds.mean():.1%}")
-                        k3.metric("Probabilité moyenne", f"{probas.mean():.1%}")
+                    # RUL
+                    has_rul = rul_path.exists()
+                    if has_rul:
+                        reg    = joblib.load(rul_path)
+                        rul_sc = joblib.load(rul_sc_path)
+                        ruls   = reg.predict(rul_sc.transform(X))
+                        df_result["rul_estime_h"] = np.maximum(0, ruls).round(1)
 
-                        # Graphique distribution des probabilités
-                        fig_hist = px.histogram(
-                            df_result, x="probabilite", color="risque",
-                            nbins=20,
-                            title="Distribution des probabilités de panne",
-                            color_discrete_map={
-                                "FAIBLE": "#28a745", "MOYEN": "#ffc107",
-                                "ÉLEVÉ": "#fd7e14",  "CRITIQUE": "#dc3545",
-                            },
+                    st.success(f"{len(df_result)} lignes analysées.")
+
+                    # -----------------------------------------------------------
+                    # A — Résumé
+                    # -----------------------------------------------------------
+                    nb_risque   = int((probas >= 0.3).sum())
+                    nb_critique = int((probas >= 0.8).sum())
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Lignes analysées", len(df_result))
+                    k2.metric("Machines à risque", nb_risque)
+                    k3.metric("Dont critiques", nb_critique)
+                    if has_rul and nb_risque > 0:
+                        rul_moyen = df_result.loc[df_result["probabilite"] >= 0.3, "rul_estime_h"].mean()
+                        k4.metric("RUL moyen (à risque)", f"{rul_moyen:.0f} h")
+
+                    st.markdown("---")
+
+                    # -----------------------------------------------------------
+                    # B — Rapport des pannes potentielles
+                    # -----------------------------------------------------------
+                    st.subheader("Rapport des pannes potentielles")
+
+                    df_risque = df_result[df_result["probabilite"] >= 0.3].sort_values(
+                        "probabilite", ascending=False
+                    ).reset_index(drop=True)
+
+                    if df_risque.empty:
+                        st.success("Aucune machine à risque détectée dans ce fichier.")
+                    else:
+                        # Colonnes affichées dans le rapport
+                        rapport_cols = ["machine_id"]
+                        if "type_machine" in df_risque.columns:
+                            rapport_cols.append("type_machine")
+                        if "usine_id" in df_risque.columns:
+                            rapport_cols.append("usine_id")
+                        rapport_cols += ["probabilite", "risque"]
+                        if has_rul:
+                            rapport_cols.append("rul_estime_h")
+                        rapport_cols.append("action")
+
+                        df_rapport = df_risque[rapport_cols].copy()
+                        df_rapport["probabilite"] = (df_rapport["probabilite"] * 100).round(1).astype(str) + " %"
+
+                        st.dataframe(
+                            df_rapport,
+                            use_container_width=True,
+                            hide_index=True,
                         )
-                        st.plotly_chart(fig_hist, use_container_width=True)
 
-                        # Tableau résultat
-                        st.subheader("Résultats détaillés")
-                        st.dataframe(df_result, use_container_width=True)
-
-                        # Téléchargement résultats
                         st.download_button(
-                            label="Télécharger les résultats",
-                            data=df_result.to_csv(index=False).encode("utf-8"),
-                            file_name="mecha_predictions.csv",
+                            label=f"Télécharger le rapport ({len(df_risque)} machines à risque)",
+                            data=df_risque[rapport_cols].to_csv(index=False).encode("utf-8"),
+                            file_name="rapport_pannes_mecha.csv",
                             mime="text/csv",
                         )
 
-                        # Comparaison avec label réel si présent
-                        if "en_panne" in df_upload.columns or "panne_dans_24h" in df_upload.columns:
-                            label_col = "panne_dans_24h" if "panne_dans_24h" in df_upload.columns else "en_panne"
-                            y_true = df_upload[label_col].values
-                            from sklearn.metrics import classification_report
-                            report = classification_report(y_true, preds, output_dict=True)
-                            st.subheader("Comparaison avec les labels réels")
-                            st.dataframe(pd.DataFrame(report).T.round(3), use_container_width=True)
+                    st.markdown("---")
+
+                    # -----------------------------------------------------------
+                    # C — Visualisations
+                    # -----------------------------------------------------------
+                    col_viz1, col_viz2 = st.columns(2)
+
+                    with col_viz1:
+                        # Camembert répartition par niveau de risque
+                        risk_counts = df_result["risque"].value_counts().reset_index()
+                        risk_counts.columns = ["risque", "count"]
+                        fig_pie = px.pie(
+                            risk_counts, values="count", names="risque",
+                            title="Répartition par niveau de risque",
+                            color="risque",
+                            color_discrete_map=RISK_COLORS,
+                        )
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
+                    with col_viz2:
+                        # Barres RUL des machines à risque (plus urgent = RUL le plus faible)
+                        if has_rul and not df_risque.empty:
+                            df_rul_chart = df_risque.nsmallest(20, "rul_estime_h")[
+                                ["machine_id", "rul_estime_h", "risque"]
+                            ].sort_values("rul_estime_h")
+                            fig_rul = px.bar(
+                                df_rul_chart, x="machine_id", y="rul_estime_h",
+                                color="risque",
+                                color_discrete_map=RISK_COLORS,
+                                title="RUL des 20 machines les plus urgentes (heures restantes)",
+                                labels={"rul_estime_h": "RUL (h)", "machine_id": "Machine"},
+                            )
+                            fig_rul.update_layout(xaxis_tickangle=-45)
+                            st.plotly_chart(fig_rul, use_container_width=True)
+                        elif not has_rul:
+                            st.info("Modèle RUL non disponible.")
+
+                    st.markdown("---")
+
+                    # -----------------------------------------------------------
+                    # D — Données complètes
+                    # -----------------------------------------------------------
+                    with st.expander("Données complètes (toutes les lignes)"):
+                        st.dataframe(df_result, use_container_width=True)
+                        st.download_button(
+                            label="Télécharger le CSV complet avec prédictions",
+                            data=df_result.to_csv(index=False).encode("utf-8"),
+                            file_name="mecha_predictions_completes.csv",
+                            mime="text/csv",
+                        )
+
+                    # -----------------------------------------------------------
+                    # E — Comparaison labels réels (si présents)
+                    # -----------------------------------------------------------
+                    if "en_panne" in df_upload.columns or "panne_dans_24h" in df_upload.columns:
+                        label_col = "panne_dans_24h" if "panne_dans_24h" in df_upload.columns else "en_panne"
+                        y_true = df_upload[label_col].values
+                        from sklearn.metrics import classification_report
+                        report = classification_report(y_true, preds, output_dict=True)
+                        st.subheader("Comparaison avec les labels réels")
+                        st.dataframe(pd.DataFrame(report).T.round(3), use_container_width=True)
 
                 except Exception as e:
                     st.error(f"Erreur lors du traitement : {e}")
@@ -427,7 +553,7 @@ elif page == "🔍 Prédiction en temps réel":
 # Page 3 : Analyse des capteurs
 # ---------------------------------------------------------------------------
 
-elif page == "📈 Analyse des capteurs":
+elif page == "Analyse des capteurs":
     st.title("Analyse des données capteurs")
 
     df = load_data()
@@ -495,7 +621,7 @@ elif page == "📈 Analyse des capteurs":
 # Page 4 : Performance des modèles
 # ---------------------------------------------------------------------------
 
-elif page == "🤖 Performance des modèles":
+elif page == "Performance des modèles":
     st.title("Performance des modèles de Machine Learning")
 
     results = load_training_results()
@@ -511,39 +637,51 @@ elif page == "🤖 Performance des modèles":
 
     for task_key, task_results in results.items():
         label = TASK_LABELS.get(task_key, task_key)
-        st.subheader(f"📋 {label}")
+        st.subheader(label)
 
-        if "regression" in task_key:
+        if not task_results:
+            st.info("Aucun résultat disponible pour cette tâche.")
+        elif "regression" in task_key:
             # Tableau de régression
-            rows = [{"Modèle": k, **v} for k, v in task_results.items()]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            rows = [{"Modèle": k, **v} for k, v in task_results.items()
+                    if isinstance(v, dict)]
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
         else:
             # Tableau de classification
-            rows = []
-            for model_name, metrics in task_results.items():
-                row = {"Modèle": model_name.replace("_", " ").title()}
-                row.update({k: v for k, v in metrics.items()
-                             if k in ("accuracy", "precision", "recall", "f1_score", "auc_roc")})
-                rows.append(row)
-            metrics_df = pd.DataFrame(rows)
-            st.dataframe(metrics_df, use_container_width=True)
+            # anomaly_detection a une structure plate {metric: value}, pas {model: {metric: value}}
+            first_val = next(iter(task_results.values()))
+            if not isinstance(first_val, dict):
+                st.dataframe(
+                    pd.DataFrame([task_results]).rename(columns=lambda c: c.replace("_", " ").title()),
+                    use_container_width=True,
+                )
+            else:
+                rows = []
+                for model_name, metrics in task_results.items():
+                    row = {"Modèle": model_name.replace("_", " ").title()}
+                    row.update({k: v for k, v in metrics.items()
+                                 if k in ("accuracy", "precision", "recall", "f1_score", "auc_roc")})
+                    rows.append(row)
+                metrics_df = pd.DataFrame(rows)
+                st.dataframe(metrics_df, use_container_width=True)
 
-            # Graphique comparatif
-            fig = go.Figure()
-            for _, row in metrics_df.iterrows():
-                fig.add_trace(go.Bar(
-                    name=row["Modèle"],
-                    x=["Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"],
-                    y=[row.get("accuracy", 0), row.get("precision", 0),
-                       row.get("recall", 0),   row.get("f1_score", 0),
-                       row.get("auc_roc", 0)],
-                ))
-            fig.update_layout(
-                title=f"Comparaison des modèles — {label}",
-                barmode="group",
-                yaxis_range=[0, 1],
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                # Graphique comparatif
+                fig = go.Figure()
+                for _, row in metrics_df.iterrows():
+                    fig.add_trace(go.Bar(
+                        name=row["Modèle"],
+                        x=["Accuracy", "Precision", "Recall", "F1-Score", "AUC-ROC"],
+                        y=[row.get("accuracy", 0), row.get("precision", 0),
+                           row.get("recall", 0),   row.get("f1_score", 0),
+                           row.get("auc_roc", 0)],
+                    ))
+                fig.update_layout(
+                    title=f"Comparaison des modèles — {label}",
+                    barmode="group",
+                    yaxis_range=[0, 1],
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
         st.markdown("---")
 
