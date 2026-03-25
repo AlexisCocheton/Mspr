@@ -9,17 +9,21 @@ Fournit aux équipes métiers (maintenance, production, pilotage) :
 """
 
 import json
+import os
+import time
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import joblib
+import httpx
 from pathlib import Path
 
 BASE_DIR      = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = BASE_DIR / "data" / "processed"
 MODELS_DIR    = BASE_DIR / "models"
+API_URL       = os.getenv("API_URL", "http://localhost:8000")
 
 SENSOR_COLS = [
     "temperature_C", "vibration_mm_s", "courant_A",
@@ -123,6 +127,7 @@ page = st.sidebar.radio(
         "Prédiction en temps réel",
         "Analyse des capteurs",
         "Performance des modèles",
+        "Monitoring Temps Réel",
     ],
 )
 
@@ -693,3 +698,171 @@ elif page == "Performance des modèles":
             st.image(str(img), caption=img.stem.replace("_", " ").title())
     else:
         st.info("Aucune image. Lancez l'entraînement pour générer les graphiques.")
+
+
+# ---------------------------------------------------------------------------
+# Page 5 : Monitoring Temps Réel (PostgreSQL)
+# ---------------------------------------------------------------------------
+
+def _fetch_recent_predictions(limit: int = 100) -> pd.DataFrame | None:
+    """Appelle GET /monitoring/recent. Retourne None si l'API est indisponible."""
+    try:
+        r = httpx.get(f"{API_URL}/monitoring/recent",
+                      params={"limit": limit}, timeout=5.0)
+        if r.status_code == 200:
+            rows = r.json().get("predictions", [])
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_machine_summary() -> pd.DataFrame | None:
+    """Appelle GET /monitoring/machines. Retourne None si l'API est indisponible."""
+    try:
+        r = httpx.get(f"{API_URL}/monitoring/machines", timeout=5.0)
+        if r.status_code == 200:
+            rows = r.json().get("machines", [])
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+        return None
+    except Exception:
+        return None
+
+
+RISK_COLORS_LOWER = {
+    "critique": "#dc3545",
+    "élevé":    "#fd7e14",
+    "moyen":    "#ffc107",
+    "faible":   "#28a745",
+    "anomalie": "#dc3545",
+    "suspect":  "#fd7e14",
+    "normal":   "#28a745",
+}
+
+if page == "Monitoring Temps Réel":
+    st.title("Monitoring Temps Réel")
+    st.caption(
+        f"Données en direct depuis PostgreSQL via `{API_URL}` — "
+        "rafraîchissement auto toutes les 5 secondes"
+    )
+
+    col_ctrl1, col_ctrl2 = st.columns([3, 1])
+    with col_ctrl1:
+        limit = st.slider("Nombre de prédictions à afficher", 10, 200, 50, step=10)
+    with col_ctrl2:
+        auto_refresh = st.checkbox("Auto-refresh (5s)", value=True)
+
+    placeholder = st.empty()
+
+    with placeholder.container():
+        df_recent  = _fetch_recent_predictions(limit=limit)
+        df_summary = _fetch_machine_summary()
+
+        if df_recent is None or df_summary is None:
+            st.warning(
+                "Impossible de joindre l'API ou la base de données. "
+                "Vérifiez que PostgreSQL est démarré et que le simulateur tourne."
+            )
+            st.stop()
+
+        if df_recent.empty:
+            st.info(
+                "Aucune donnée reçue pour le moment. "
+                "Lancez le simulateur : `python src/sensor_simulator.py`"
+            )
+        else:
+            # --- KPIs ---
+            n_total    = len(df_recent)
+            n_critique = int((df_recent["panne24h_risk_level"] == "critique").sum())
+            n_eleve    = int((df_recent["panne24h_risk_level"] == "élevé").sum())
+            n_anomaly  = int(df_recent["is_anomaly"].sum()) if "is_anomaly" in df_recent else 0
+
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Prédictions (fenêtre)", n_total)
+            k2.metric("Risque critique",        n_critique)
+            k3.metric("Risque élevé",           n_eleve)
+            k4.metric("Anomalies détectées",    n_anomaly)
+
+            st.markdown("---")
+
+            # --- Répartition des alertes ---
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                st.subheader("Répartition par niveau de risque")
+                risk_counts = df_recent["panne24h_risk_level"].value_counts().reset_index()
+                risk_counts.columns = ["Niveau", "Nombre"]
+                fig_risk = px.bar(
+                    risk_counts, x="Niveau", y="Nombre",
+                    color="Niveau",
+                    color_discrete_map=RISK_COLORS_LOWER,
+                    title="Alertes panne 24h par niveau",
+                )
+                st.plotly_chart(fig_risk, use_container_width=True)
+
+            with col_v2:
+                st.subheader("Anomalies détectées")
+                if "anomaly_risk_level" in df_recent.columns:
+                    ano_counts = df_recent["anomaly_risk_level"].value_counts().reset_index()
+                    ano_counts.columns = ["Niveau", "Nombre"]
+                    fig_ano = px.pie(
+                        ano_counts, names="Niveau", values="Nombre",
+                        color="Niveau",
+                        color_discrete_map=RISK_COLORS_LOWER,
+                        title="Répartition Isolation Forest",
+                    )
+                    st.plotly_chart(fig_ano, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- Jauges par machine ---
+            if not df_summary.empty:
+                st.subheader("État en direct par machine")
+                machines = df_summary.to_dict("records")
+                for i in range(0, len(machines), 4):
+                    row_machines = machines[i:i + 4]
+                    cols = st.columns(len(row_machines))
+                    for col, m in zip(cols, row_machines):
+                        with col:
+                            prob = float(m.get("panne24h_probability", 0))
+                            mid  = m["machine_id"].split("-M")[-1]
+                            fig_g = go.Figure(go.Indicator(
+                                mode="gauge+number",
+                                value=round(prob * 100, 1),
+                                title={"text": f"M{mid}<br><sub>{m['type_machine']}</sub>"},
+                                gauge={
+                                    "axis": {"range": [0, 100]},
+                                    "bar":  {"color": "darkblue"},
+                                    "steps": [
+                                        {"range": [0,  30], "color": "#28a745"},
+                                        {"range": [30, 50], "color": "#ffc107"},
+                                        {"range": [50, 80], "color": "#fd7e14"},
+                                        {"range": [80,100], "color": "#dc3545"},
+                                    ],
+                                },
+                            ))
+                            fig_g.update_layout(
+                                height=200,
+                                margin=dict(t=50, b=0, l=0, r=0),
+                            )
+                            st.plotly_chart(fig_g, use_container_width=True, key=f"gauge_{m['machine_id']}")
+
+            st.markdown("---")
+
+            # --- Tableau des dernières prédictions ---
+            st.subheader("Dernières prédictions")
+            display_cols = [
+                "predicted_at", "machine_id", "usine_id", "type_machine",
+                "panne24h_probability", "panne24h_risk_level",
+                "rul_hours", "rul_risk_level",
+                "is_anomaly", "anomaly_risk_level",
+            ]
+            df_disp = df_recent[[c for c in display_cols if c in df_recent.columns]].copy()
+            if "panne24h_probability" in df_disp.columns:
+                df_disp["panne24h_probability"] = (
+                    df_disp["panne24h_probability"] * 100
+                ).round(1).astype(str) + " %"
+            st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
