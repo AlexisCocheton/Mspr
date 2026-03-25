@@ -14,6 +14,7 @@ Expose les modèles ML via des endpoints FastAPI :
 import json
 import numpy as np
 import joblib
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from fastapi import FastAPI, HTTPException
@@ -21,16 +22,6 @@ from pydantic import BaseModel, Field
 
 BASE_DIR   = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
-
-app = FastAPI(
-    title="MECHA - API Maintenance Prédictive",
-    description="API de prédiction de pannes sur le dataset unifié MECHA",
-    version="3.0.0",
-)
-
-# ---------------------------------------------------------------------------
-# Chargement des modèles au démarrage
-# ---------------------------------------------------------------------------
 
 models = {}
 
@@ -59,9 +50,22 @@ def load_models():
             models["category_maps"] = json.load(f)
 
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     load_models()
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="MECHA - API Maintenance Prédictive",
+    description="API de prédiction de pannes sur le dataset unifié MECHA",
+    version="3.0.0",
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +185,7 @@ async def model_info():
     info = {"available_models": list(models.keys())}
     results_path = MODELS_DIR / "training_results.json"
     if results_path.exists():
-        with open(results_path) as f:
+        with open(results_path, encoding="utf-8") as f:
             info["training_results"] = json.load(f)
     return info
 
