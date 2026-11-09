@@ -7,7 +7,10 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.model_training import prepare_features, FEATURE_COLS
+from src.model_training import (
+    prepare_features, FEATURE_COLS,
+    balance_dataset, compute_metrics, alert_breakdown,
+)
 
 
 @pytest.fixture
@@ -85,3 +88,110 @@ def test_no_rolling_features_in_feature_cols():
     for col in FEATURE_COLS:
         assert "mean_24h" not in col
         assert "std_24h" not in col
+
+
+def test_balance_dataset_50_50():
+    """Le rééquilibrage produit autant de pannes que de non-pannes."""
+    X = np.arange(200).reshape(100, 2)
+    y = np.array([1] * 10 + [0] * 90)
+    Xb, yb = balance_dataset(X, y)
+    assert len(yb) == 20
+    assert yb.sum() == 10
+    assert Xb.shape == (20, 2)
+
+
+def test_modele_naif_paradoxe_accuracy():
+    """
+    Un modèle qui répond toujours « pas de panne » obtient ~97 % d'accuracy
+    sur des données réelles (2,3 % de pannes) sans détecter aucune panne.
+    C'est pourquoi les modèles sont aussi évalués sur un test 50/50.
+    """
+    y_reel = np.array([1] * 23 + [0] * 977)
+    m_reel = compute_metrics(y_reel, np.zeros_like(y_reel), np.zeros(len(y_reel)))
+    assert m_reel["accuracy"] == pytest.approx(0.977)
+    assert m_reel["recall"] == 0.0
+    assert m_reel["f1_score"] == 0.0
+
+    y_5050 = np.array([1] * 50 + [0] * 50)
+    m_5050 = compute_metrics(y_5050, np.zeros_like(y_5050), np.zeros(len(y_5050)))
+    assert m_5050["accuracy"] == pytest.approx(0.5)
+
+
+def test_alert_breakdown_par_niveau():
+    """Comptage des alertes et des fausses alertes par niveau de risque."""
+    y_true  = np.array([1,   0,    0,   1,   0,   1])
+    y_proba = np.array([0.9, 0.85, 0.6, 0.4, 0.1, 0.2])
+    out = alert_breakdown(y_true, y_proba)
+
+    critique = out["niveaux"]["critique"]
+    assert critique["n_alertes"] == 2
+    assert critique["vraies_pannes"] == 1
+    assert critique["taux_fausses_alertes"] == pytest.approx(0.5)
+
+    assert out["niveaux"]["élevé"]["n_alertes"] == 1
+    assert out["niveaux"]["élevé"]["taux_fausses_alertes"] == pytest.approx(1.0)
+    assert out["niveaux"]["moyen"]["vraies_pannes"] == 1
+    assert out["pannes_non_alertees"] == 1
+
+
+def test_alert_breakdown_seuils_inclusifs():
+    """Une probabilité exactement égale au seuil tombe dans le niveau supérieur (comme l'API)."""
+    out = alert_breakdown(np.array([1, 1, 1]), np.array([0.8, 0.5, 0.3]))
+    assert out["niveaux"]["critique"]["n_alertes"] == 1
+    assert out["niveaux"]["élevé"]["n_alertes"] == 1
+    assert out["niveaux"]["moyen"]["n_alertes"] == 1
+
+
+def test_alert_breakdown_niveau_vide():
+    """Aucune alerte dans un niveau : taux de fausses alertes non défini."""
+    out = alert_breakdown(np.array([0, 1]), np.array([0.1, 0.2]))
+    assert out["niveaux"]["critique"]["taux_fausses_alertes"] is None
+    assert out["pannes_non_alertees"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Validation de la règle d'alerte (rejeu temporel)
+# ---------------------------------------------------------------------------
+
+from src.model_training import (  # noqa: E402
+    debuts_de_panne, simuler_alertes, evaluer_alertes_evenements, alertes_suivies_de_panne,
+)
+
+
+def test_debuts_de_panne():
+    assert list(debuts_de_panne(np.array([0, 1, 1, 0, 0, 1]))) == [1, 5]
+    assert list(debuts_de_panne(np.array([1, 1, 0]))) == [0]
+
+
+def test_simuler_alertes_lectures_consecutives():
+    heures = np.arange(10.0)
+    proba  = np.array([.9, .1, .9, .9, .9, .1, .9, .9, .1, .1])
+    alertes = simuler_alertes(proba, np.zeros(10), heures, seuil=0.8, lectures=2, delai_h=0)
+    assert list(alertes) == [3, 4, 7]
+
+
+def test_simuler_alertes_delai_entre_alertes():
+    heures = np.arange(10.0)
+    alertes = simuler_alertes(np.full(10, 0.9), np.zeros(10), heures, seuil=0.8, lectures=1, delai_h=5)
+    assert list(alertes) == [0, 5]
+
+
+def test_simuler_alertes_ignore_machine_deja_en_panne():
+    heures = np.arange(4.0)
+    alertes = simuler_alertes(np.full(4, 0.9), np.array([1, 1, 1, 1]), heures, 0.8, 1, 0)
+    assert len(alertes) == 0
+
+
+def test_evaluer_alertes_evenements():
+    alertes = np.array([10.0, 50.0])
+    pannes  = np.array([20.0, 200.0])
+    r = evaluer_alertes_evenements(alertes, pannes, horizon_h=24)
+    assert r["alertes_justifiees"] == 1      # 10 -> panne à 20 ; 50 -> rien avant 74
+    assert r["pannes_anticipees"] == 1       # la panne à 200 n'a pas d'alerte dans [176, 200)
+    assert r["anticipations_h"] == [10.0]
+
+
+def test_alertes_suivies_de_panne_exclut_les_alertes_non_jugeables():
+    alertes = np.array([10.0, 95.0])
+    jugeables, suivies = alertes_suivies_de_panne(alertes, np.array([30.0]), fin_h=100, horizon_h=24)
+    assert (jugeables, suivies) == (1, 1)    # l'alerte à 95 h n'a pas 24 h de recul
