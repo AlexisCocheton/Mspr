@@ -94,15 +94,25 @@
 
 ### Correspondance besoins → solution livrée
 
+Chiffres issus de `models/training_results.json` ; détail dans le [rapport de validation](RAPPORT_VALIDATION_DEPLOIEMENT.md).
+
 | Besoin | Composant livré | Statut |
 |--------|----------------|--------|
-| BF1 - Prédiction 24h | Random Forest Classifier (F1=85.9%) | Livré |
-| BF2 - RUL | Random Forest Regressor (MAE=0.56h) | Livré |
-| BF3 - Classification | Endpoint `/predict/ai4i` et `/predict/pdm` | Livré |
-| BF4 - Dashboard | Streamlit 4 pages | Livré |
-| BF5 - Alertes | 4 niveaux de risque (faible/moyen/élevé/critique) | Livré |
-| BT1 - Docker | Dockerfile + docker-compose | Livré |
-| BT2 - API | FastAPI 5 endpoints | Livré |
-| BT3 - Git | Repository structuré | Livré |
-| BT4 - CI/CD | GitHub Actions | Livré |
-| BM1 - Recall > 80% | Recall PdM = 98.9%, AI4I = 80.9% | Atteint |
+| BF1 - Prédiction 24h | Random Forest « panne dans 24 h » (`POST /predict/panne24h`) : F1 0,882 sur test 50/50, rappel 94 % sur la distribution réelle | Livré |
+| BF2 - RUL | Random Forest Regressor (`POST /predict/rul`) : MAE 105 h en découpage temporel (modèle naïf : 224 h) — ordre de grandeur pour prioriser | Livré, précision limitée |
+| BF3 - Classification normal / à risque | `POST /predict/panne` et `/predict/panne24h`, 4 niveaux de risque définis dans `config/regles_metier.yaml` ; détection d'anomalies (`/predict/anomalie`) | Livré |
+| BF4 - Dashboard | Streamlit, 5 pages (dont Monitoring Temps Réel) ; prédictions via l'API ; explication de chaque prédiction | Livré |
+| BF5 - Alertes | Règle « 3 relevés consécutifs au niveau critique », anti-doublon, acquittement, notification par webhook configurable (`GET /alertes`, `POST /alertes/{id}/acquitter`) | Livré |
+| BF6 - Historique capteurs | Page « Analyse des capteurs » | Livré |
+| BF7 - Comparaison des modèles | 6 modèles + modèle naïf, deux évaluations ; page « Performance des modèles » | Livré |
+| BF8 - Saisie manuelle | Saisie manuelle et import CSV (`POST /predict/batch`) | Livré |
+| BT1 - Docker | Dockerfile + docker-compose (5 services : postgres, trainer, api, dashboard, simulator) | Livré — exécution complète à revérifier avant la soutenance |
+| BT2 - API | FastAPI, 15 endpoints, documentation Swagger (`/docs`), webhook d'ingestion `POST /webhook/sensor` | Livré |
+| BT3 - Git | Dépôt GitHub structuré | Livré |
+| BT4 - CI/CD | GitHub Actions : 88 tests sur Python 3.11 et 3.12, construction et vérification de l'image Docker | Livré |
+| BT5 - Capteurs IoT | Température, vibration, courant, pression, vitesse ; contrôle de plausibilité et nettoyage | Livré |
+| BT6 - On-premise | Tous les services sont auto-hébergés (aucun service cloud externe) ; la notification pointe vers une URL interne configurable | Atteint |
+| BM1 - Recall > 80 % | 94 % des relevés précédant une panne détectés (relevé par relevé). Par événement, avec la règle d'alerte retenue : 75 % des pannes signalées dans les 24 h qui précèdent (82 % avec 2 relevés consécutifs, pour 45 % d'alertes en plus) | Atteint relevé par relevé ; partiellement par événement — choix de règle à arbitrer |
+| BM2 - Fausses alertes critiques < 5 % | 74 % des alertes ne sont pas suivies d'une panne **dans les 24 h** ; 10 % ne sont pas suivies d'une panne **dans les 7 jours** | **Non atteint à 24 h** — proposition : redéfinir l'alerte à 7 jours (cf. rapport §4.4) |
+| BM3 - Sans compétence data science | Code couleur, recommandation textuelle, explication des 3 facteurs principaux, guide utilisateur | Atteint (à confirmer pendant le pilote) |
+| BM4 - Déploiement progressif | Plan en 3 phases (pilote observation → France → Espagne) ; règles paramétrables par site | Prévu (plan de déploiement) |
