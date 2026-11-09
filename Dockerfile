@@ -1,22 +1,24 @@
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Installer les dépendances système
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copier et installer les dépendances Python
+# Dépendances Python (couche mise en cache tant que requirements.txt ne change pas)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copier le code source
+# Code source, règles métier et générateur de données
+COPY config/ ./config/
+COPY reference/generate_dataset.py ./reference/
 COPY src/ ./src/
-COPY data/ ./data/
-COPY models/ ./models/
 
-# Exposer les ports (API: 8000, Dashboard: 8501)
+# data/ et models/ ne sont pas dans l'image : ils sont montés en volume
+# (docker-compose.yml). Au premier démarrage, le service « trainer » prépare
+# les données et entraîne les modèles s'ils sont absents (src/bootstrap.py).
+
+# Ports : API 8000, Dashboard 8501
 EXPOSE 8000 8501
 
 # Commande par défaut : lancer l'API

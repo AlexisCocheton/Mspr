@@ -1,0 +1,19 @@
+# Seuls requirements.txt, config/, reference/generate_dataset.py et src/ entrent dans l'image.
+.git
+.github
+.claude
+.env
+venv
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+data
+models
+notebooks
+docs
+tests
+archive*
+reference/*.csv
+*.pdf
+*.md

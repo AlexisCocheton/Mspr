@@ -1,22 +1,44 @@
+# MECHA — Stack complète : PostgreSQL, entraînement, API, dashboard, simulateur IoT.
+#
+#   docker compose up --build
+#
+# Premier démarrage sur un clone neuf : le service « trainer » prépare les
+# données et entraîne les modèles (10 à 15 min) avant le lancement de l'API.
+# Les démarrages suivants réutilisent les modèles présents dans ./models.
+#
+# Identifiants : copier .env.example en .env pour les personnaliser.
+# Règles métier : ./config/regles_metier.yaml, monté en lecture seule ;
+# redémarrer api et dashboard après modification (docker compose restart api dashboard).
+
 services:
 
   postgres:
     image: postgres:15
     container_name: mecha-postgres
     environment:
-      POSTGRES_DB:       mecha
-      POSTGRES_USER:     mecha
-      POSTGRES_PASSWORD: mecha
+      POSTGRES_DB:       ${POSTGRES_DB:-mecha}
+      POSTGRES_USER:     ${POSTGRES_USER:-mecha}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mecha}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mecha -d mecha"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  trainer:
+    build: .
+    container_name: mecha-trainer
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    command: python -m src.bootstrap
+    restart: "no"
 
   api:
     build: .
@@ -26,17 +48,22 @@ services:
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+      - ./config:/app/config:ro
     environment:
-      DATABASE_URL: "postgresql://mecha:mecha@mecha-postgres:5432/mecha"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-mecha}:${POSTGRES_PASSWORD:-mecha}@mecha-postgres:5432/${POSTGRES_DB:-mecha}"
+      MECHA_ALERT_WEBHOOK_URL: ${MECHA_ALERT_WEBHOOK_URL:-}
     command: uvicorn src.api:app --host 0.0.0.0 --port 8000
     depends_on:
       postgres:
         condition: service_healthy
+      trainer:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
-      interval: 30s
+      test: ["CMD", "python", "-c", "import httpx, sys; sys.exit(httpx.get('http://localhost:8000/health').status_code != 200)"]
+      interval: 15s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 20s
 
   dashboard:
     build: .
@@ -46,22 +73,23 @@ services:
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+      - ./config:/app/config:ro
     environment:
-      DATABASE_URL: "postgresql://mecha:mecha@mecha-postgres:5432/mecha"
-      API_URL:      "http://mecha-api:8000"
+      API_URL: "http://mecha-api:8000"
     command: streamlit run src/dashboard.py --server.port 8501 --server.address 0.0.0.0
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   simulator:
     build: .
     container_name: mecha-simulator
     volumes:
       - ./data:/app/data
+      - ./config:/app/config:ro
     environment:
       API_URL:              "http://mecha-api:8000"
       DATA_PATH:            "/app/data/raw/mecha_dataset_full.csv"
-      SIMULATOR_DELAY:      "2.0"
       SIMULATOR_MAX_RETRY:  "30"
     command: python src/sensor_simulator.py
     depends_on:
