@@ -1,0 +1,10 @@
+{
+  "lignes_brutes": 354162,
+  "doublons_supprimes": 354,
+  "valeurs_manquantes_brutes": 15553,
+  "valeurs_hors_bornes": 829,
+  "valeurs_capteur_fige": 1610,
+  "valeurs_imputees": 13574,
+  "lignes_ecartees": 2203,
+  "lignes_nettoyees": 351605
+}

@@ -19,13 +19,23 @@ Corrélations physiques implémentées :
                               (sans entretien → usure → valeurs hors-norme)
   5. Saisonnalité          → été (juin-août) en Espagne/sud +10 °C ambiants
                               → légère augmentation température machine
+
+Hétérogénéité et qualité des données (fichier BRUT, avant nettoyage) :
+  6. Sites espagnols équipés plus récemment → historique plus court (12 mois
+     au lieu de 18) et capteurs plus sujets aux pertes de mesure.
+  7. Défauts capteurs injectés après simulation (cf. injecter_defauts_qualite) :
+     valeurs manquantes, pertes de transmission, capteurs figés, valeurs
+     aberrantes, doublons de transmission. Les labels ne sont pas modifiés.
+     Le nettoyage est fait par src/data_preparation.py.
+
+Sortie : data/raw/mecha_dataset_full.csv
 """
 
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
 import random
-import os
 
 # ─── Paramètres de simulation ────────────────────────────────────────────────
 SEED = 42
@@ -45,6 +55,32 @@ TYPE_MACHINES = ["CNC-Fraisage", "CNC-Tournage", "Découpe-Laser", "Centre-Usina
 # Durée de simulation : 18 mois (granularité 1 heure)
 DATE_DEBUT = datetime(2024, 1, 1)
 DATE_FIN   = datetime(2025, 6, 30)
+
+# Corrélation 6 : capteurs IoT déployés plus tard sur les sites espagnols
+DEBUT_COLLECTE_PAYS = {"France": DATE_DEBUT, "Espagne": datetime(2024, 7, 1)}
+
+SORTIE = Path(__file__).resolve().parent.parent / "data" / "raw" / "mecha_dataset_full.csv"
+
+CAPTEURS = ["temperature_C", "vibration_mm_s", "courant_A", "pression_bar", "vitesse_tr_min"]
+
+# Corrélation 7 : défauts de qualité injectés dans le fichier brut
+DEFAUTS = {
+    "taux_valeur_manquante":      {"France": 0.005, "Espagne": 0.012},  # par capteur et par relevé
+    "pertes_transmission_par_an": 6,          # coupures réseau par machine (tous capteurs absents)
+    "duree_perte_h":              (1, 6),
+    "capteurs_figes_par_an":      3,          # épisodes par machine
+    "duree_capteur_fige_h":       (6, 24),
+    "taux_valeur_aberrante":      0.0005,     # par capteur et par relevé
+    "taux_doublon":               0.001,      # relevés transmis deux fois
+}
+# Valeurs physiquement impossibles typiques d'un capteur en erreur
+VALEURS_ABERRANTES = {
+    "temperature_C":  [999.9, -273.0],
+    "vibration_mm_s": [99.99, -1.0],
+    "courant_A":      [-5.0, 500.0],
+    "pression_bar":   [-1.0, 99.0],
+    "vitesse_tr_min": [-1.0, 65535.0],
+}
 
 # ─── Fonctions utilitaires ────────────────────────────────────────────────────
 
@@ -286,6 +322,74 @@ def generer_machine(usine_id, machine_id_local, type_machine, dates, climat):
     return records
 
 
+# ─── Défauts de qualité (corrélation 7) ───────────────────────────────────────
+
+def _episodes(rng, n_lignes, n_episodes, duree_min, duree_max):
+    """Intervalles [début, fin) aléatoires dans une série de n_lignes."""
+    for _ in range(n_episodes):
+        duree = int(rng.integers(duree_min, duree_max + 1))
+        if n_lignes <= duree:
+            continue
+        debut = int(rng.integers(0, n_lignes - duree))
+        yield debut, debut + duree
+
+
+def injecter_defauts_qualite(df, seed=SEED + 1):
+    """
+    Dégrade les mesures capteurs comme le ferait un parc IoT réel.
+    Utilise son propre générateur aléatoire : la simulation physique en amont
+    reste identique, seuls les défauts s'ajoutent. Les labels sont intacts.
+    Retourne (df_brut, bilan des défauts injectés).
+    """
+    rng = np.random.default_rng(seed)
+    df = df.sort_values(["machine_id", "timestamp"]).reset_index(drop=True)
+    pays = df["usine_id"].map(lambda u: USINES[u]["pays"])
+    bilan = {}
+
+    # 1. Valeurs manquantes ponctuelles (plus fréquentes sur les sites récents)
+    taux = pays.map(DEFAUTS["taux_valeur_manquante"]).to_numpy()
+    n_manq = 0
+    for col in CAPTEURS:
+        masque = rng.random(len(df)) < taux
+        df.loc[masque, col] = np.nan
+        n_manq += int(masque.sum())
+    bilan["valeurs_manquantes"] = n_manq
+
+    # 2. Pertes de transmission (tous les capteurs absents) et 3. capteurs figés
+    n_pertes = n_figes = 0
+    for _, idx in df.groupby("machine_id").indices.items():
+        n = len(idx)
+        annees = n / 8760
+        for debut, fin in _episodes(rng, n, rng.poisson(DEFAUTS["pertes_transmission_par_an"] * annees),
+                                    *DEFAUTS["duree_perte_h"]):
+            df.loc[idx[debut:fin], CAPTEURS] = np.nan
+            n_pertes += 1
+        for debut, fin in _episodes(rng, n, rng.poisson(DEFAUTS["capteurs_figes_par_an"] * annees),
+                                    *DEFAUTS["duree_capteur_fige_h"]):
+            col = CAPTEURS[int(rng.integers(len(CAPTEURS)))]
+            df.loc[idx[debut:fin], col] = df.at[idx[debut], col]
+            n_figes += 1
+    bilan["pertes_transmission"] = n_pertes
+    bilan["episodes_capteur_fige"] = n_figes
+
+    # 4. Valeurs aberrantes (codes d'erreur capteur, hors limites physiques)
+    n_aber = 0
+    for col in CAPTEURS:
+        masque = (rng.random(len(df)) < DEFAUTS["taux_valeur_aberrante"]) & df[col].notna().to_numpy()
+        df.loc[masque, col] = rng.choice(VALEURS_ABERRANTES[col], size=int(masque.sum()))
+        n_aber += int(masque.sum())
+    bilan["valeurs_aberrantes"] = n_aber
+
+    # 5. Doublons de transmission (même machine, même horodatage)
+    doublons = df.sample(frac=DEFAUTS["taux_doublon"], random_state=seed)
+    df = (pd.concat([df, doublons])
+          .sort_values(["machine_id", "timestamp"], kind="stable")
+          .reset_index(drop=True))
+    bilan["doublons"] = len(doublons)
+
+    return df, bilan
+
+
 # ─── Génération principale ────────────────────────────────────────────────────
 
 def generer_dataset():
@@ -293,35 +397,34 @@ def generer_dataset():
     print("  MECHA — Génération du jeu de données synthétique")
     print("=" * 60)
 
-    # Génération des timestamps (toutes les heures)
-    dates = [DATE_DEBUT + timedelta(hours=h)
-             for h in range(int((DATE_FIN - DATE_DEBUT).total_seconds() // 3600))]
-    print(f"Période    : {DATE_DEBUT.date()} → {DATE_FIN.date()}")
-    print(f"Timestamps : {len(dates):,} points / machine\n")
-
     all_records = []
 
     for usine_id, infos in USINES.items():
-        print(f"  Usine {usine_id} ({infos['ville']}, {infos['pays']}) — {infos['nb_machines']} machines")
+        # Génération des timestamps (toutes les heures) depuis le début de collecte du site
+        debut = DEBUT_COLLECTE_PAYS[infos["pays"]]
+        dates = [debut + timedelta(hours=h)
+                 for h in range(int((DATE_FIN - debut).total_seconds() // 3600))]
+        print(f"  Usine {usine_id} ({infos['ville']}, {infos['pays']}) — "
+              f"{infos['nb_machines']} machines — {debut.date()} → {DATE_FIN.date()}")
         for m in range(1, infos["nb_machines"] + 1):
             type_m = random.choice(TYPE_MACHINES)
             records = generer_machine(usine_id, m, type_m, dates, infos["climat"])
             all_records.extend(records)
 
     df = pd.DataFrame(all_records)
-    print(f"\nDataset total : {len(df):,} lignes × {len(df.columns)} colonnes")
+    print(f"\nDataset simulé : {len(df):,} lignes × {len(df.columns)} colonnes")
 
-    # Sauvegarde
-    os.makedirs(".", exist_ok=True)
-    df.to_csv("mecha_dataset_full.csv", index=False)
-    print("  ✓ mecha_dataset_full.csv sauvegardé")
+    # ── Défauts de qualité : fichier brut tel qu'il sortirait du parc IoT ──
+    df_brut, bilan = injecter_defauts_qualite(df)
+    print("\nDéfauts injectés dans le fichier brut :")
+    for k, v in bilan.items():
+        print(f"  {k:<24} : {v:,}")
 
-    # Échantillon allégé (une mesure toutes les 4h) pour démonstrations
-    df_sample = df[df.index % 4 == 0].reset_index(drop=True)
-    df_sample.to_csv("mecha_dataset_sample.csv", index=False)
-    print(f"  ✓ mecha_dataset_sample.csv sauvegardé ({len(df_sample):,} lignes)")
+    SORTIE.parent.mkdir(parents=True, exist_ok=True)
+    df_brut.to_csv(SORTIE, index=False)
+    print(f"\n  ✓ {SORTIE} sauvegardé ({len(df_brut):,} lignes)")
 
-    # ── Vérification des corrélations ──────────────────────────────────────
+    # ── Vérification des corrélations (sur les données simulées, avant défauts) ──
     print("\n─── Vérification des corrélations ───────────────────────────────")
     print("\nMoyenne température par état_machine :")
     print(df.groupby("etat_machine")["temperature_C"].mean().sort_values(ascending=False).to_string())
