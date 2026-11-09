@@ -2,41 +2,57 @@
 API REST pour la solution de maintenance prédictive MECHA.
 
 Expose les modèles ML via des endpoints FastAPI :
-- POST /predict/panne        : prédit si la machine est en panne (en_panne)
-- POST /predict/panne24h     : prédit si une panne survient dans les 24 h
-- POST /predict/rul          : prédit le temps restant avant défaillance (RUL)
-- POST /predict/anomalie     : détecte un comportement capteur atypique (Isolation Forest)
-- POST /predict/panne/explain: explique les facteurs de la prédiction panne (SHAP)
-- POST /webhook/sensor       : reçoit une lecture capteur, fait l'inférence, persiste en DB
-- GET  /monitoring/recent    : dernières prédictions depuis PostgreSQL
-- GET  /monitoring/machines  : dernière prédiction par machine
-- GET  /health               : état de l'API
-- GET  /model/info           : métriques d'entraînement
+- POST /predict/panne            : prédit si la machine est en panne (en_panne)
+- POST /predict/panne24h         : prédit si une panne survient dans les 24 h
+- POST /predict/rul              : prédit le temps restant avant défaillance (RUL)
+- POST /predict/anomalie         : détecte un comportement capteur atypique (Isolation Forest)
+- POST /predict/batch            : panne 24 h + RUL pour plusieurs machines (import CSV)
+- POST /predict/panne/explain    : facteurs de la prédiction en_panne (SHAP)
+- POST /predict/panne24h/explain : facteurs de la prédiction panne 24 h (SHAP)
+- POST /webhook/sensor           : reçoit une lecture capteur, fait l'inférence,
+                                   persiste en DB et déclenche les alertes
+- GET  /monitoring/recent        : dernières prédictions depuis PostgreSQL
+- GET  /monitoring/machines      : dernière prédiction par machine
+- GET  /alertes                  : alertes (filtrables par statut)
+- POST /alertes/{id}/acquitter   : acquittement d'une alerte par la maintenance
+- GET  /config/regles            : règles métier actives (config/regles_metier.yaml)
+- GET  /health                   : état de l'API
+- GET  /model/info               : métriques d'entraînement
+
+Les seuils, niveaux de risque et règles d'alerte proviennent de
+config/regles_metier.yaml (module src.regles).
+
+Les endpoints sont synchrones (def) : FastAPI les exécute dans un pool de
+threads, ce qui évite de bloquer la boucle asynchrone pendant les appels
+base de données et les inférences scikit-learn.
 """
 
 import json
 import logging
-import numpy as np
-import joblib
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
+
+import httpx
+import joblib
+import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
+
+from src import regles
 
 logger = logging.getLogger(__name__)
 
-# Import conditionnel de la couche DB — les endpoints existants fonctionnent sans Postgres
+# Import conditionnel de la couche DB — les endpoints de prédiction fonctionnent sans Postgres
 try:
-    from src.database import (
-        insert_reading,
-        insert_prediction,
-        get_recent_predictions,
-        get_last_prediction_per_machine,
-    )
+    from src import database as db
     DB_AVAILABLE = True
 except Exception as _db_exc:
     logger.warning("Module database indisponible (%s) — webhook/monitoring désactivés.", _db_exc)
+    db = None
     DB_AVAILABLE = False
 
 BASE_DIR   = Path(__file__).resolve().parent.parent
@@ -46,8 +62,6 @@ models = {}
 
 
 def load_models():
-    global models
-
     for fname, key in [
         ("random_forest_classifier_mecha.joblib",     "clf_panne"),
         ("scaler_mecha.joblib",                        "scaler_panne"),
@@ -71,7 +85,13 @@ def load_models():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    regles.charger_regles()          # échoue au démarrage si le fichier de règles est invalide
     load_models()
+    if DB_AVAILABLE:
+        try:
+            db.init_schema()
+        except Exception as exc:
+            logger.warning("Initialisation du schéma impossible (%s) — base indisponible ?", exc)
     yield
 
 
@@ -82,7 +102,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="MECHA - API Maintenance Prédictive",
     description="API de prédiction de pannes sur le dataset unifié MECHA",
-    version="3.0.0",
+    version="4.0.0",
     lifespan=lifespan,
 )
 
@@ -91,15 +111,24 @@ app = FastAPI(
 # Schémas
 # ---------------------------------------------------------------------------
 
+_BORNES = regles.charger_regles()["capteurs"]
+
+
+def _champ(nom: str, description: str):
+    """Champ Pydantic borné par les limites physiques du fichier de règles."""
+    b = _BORNES[nom]
+    return Field(..., ge=b["min"], le=b["max"], description=f"{description} ({b['unite']})")
+
+
 class MechaPredictionRequest(BaseModel):
     """Données capteurs d'une machine MECHA."""
-    temperature_C:        float = Field(..., ge=-20,    le=300,    description="Température machine (°C)")
-    vibration_mm_s:       float = Field(..., ge=0,      le=20,     description="Vibration (mm/s)")
-    courant_A:            float = Field(..., ge=0,      le=100,    description="Courant électrique (A)")
-    pression_bar:         float = Field(..., ge=0,      le=20,     description="Pression hydraulique (bar)")
-    vitesse_tr_min:       float = Field(..., ge=0,      le=3000,   description="Vitesse de rotation (tr/min)")
-    age_machine_h:        int   = Field(..., ge=0,      le=200000, description="Âge de la machine (heures)")
-    h_depuis_maintenance: int   = Field(..., ge=0,      le=10000,  description="Heures depuis la dernière maintenance")
+    temperature_C:        float = _champ("temperature_C",        "Température machine")
+    vibration_mm_s:       float = _champ("vibration_mm_s",       "Vibration")
+    courant_A:            float = _champ("courant_A",            "Courant électrique")
+    pression_bar:         float = _champ("pression_bar",         "Pression hydraulique")
+    vitesse_tr_min:       float = _champ("vitesse_tr_min",       "Vitesse de rotation")
+    age_machine_h:        int   = _champ("age_machine_h",        "Âge de la machine")
+    h_depuis_maintenance: int   = _champ("h_depuis_maintenance", "Heures depuis la dernière maintenance")
     type_machine: Literal["CNC-Fraisage", "CNC-Tournage", "Découpe-Laser", "Centre-Usinage"] = Field(
         "CNC-Fraisage", description="Type de machine"
     )
@@ -153,10 +182,24 @@ class ExplainResponse(BaseModel):
     risk_level:     str
     recommendation: str
     top_features:   list[FeatureContribution]
+    methode:        str = Field(..., description="shap / importance_globale")
+
+
+class BatchRequest(BaseModel):
+    lignes: list[MechaPredictionRequest] = Field(..., min_length=1, max_length=1000)
+
+
+class BatchLigne(BaseModel):
+    panne24h: PredictionResponse
+    rul:      RULResponse | None = None
+
+
+class BatchResponse(BaseModel):
+    resultats: list[BatchLigne]
 
 
 # ---------------------------------------------------------------------------
-# Utilitaires
+# Inférence
 # ---------------------------------------------------------------------------
 
 FEATURE_NAMES = [
@@ -167,41 +210,121 @@ FEATURE_NAMES = [
 ]
 
 
-def build_feature_vector(data: MechaPredictionRequest) -> np.ndarray:
-    maps      = models.get("category_maps", {})
-    type_enc  = maps.get("type_machine", {}).get(data.type_machine, 0)
-    usine_enc = maps.get("usine_id",     {}).get(data.usine_id,     0)
+def build_feature_matrix(lignes: list[MechaPredictionRequest]) -> np.ndarray:
+    maps = models.get("category_maps", {})
     return np.array([[
-        data.temperature_C, data.vibration_mm_s, data.courant_A,
-        data.pression_bar,  data.vitesse_tr_min,
-        data.age_machine_h, data.h_depuis_maintenance,
-        type_enc, usine_enc,
-    ]])
+        d.temperature_C, d.vibration_mm_s, d.courant_A,
+        d.pression_bar,  d.vitesse_tr_min,
+        d.age_machine_h, d.h_depuis_maintenance,
+        maps.get("type_machine", {}).get(d.type_machine, 0),
+        maps.get("usine_id",     {}).get(d.usine_id,     0),
+    ] for d in lignes], dtype=float)
 
 
-def get_risk_assessment(probability: float) -> tuple[str, str]:
-    if probability >= 0.8:
-        return "critique", "ARRÊT IMMÉDIAT recommandé. Intervention urgente requise."
-    elif probability >= 0.5:
-        return "élevé",    "Planifier une maintenance préventive dans les prochaines heures."
-    elif probability >= 0.3:
-        return "moyen",    "Surveillance renforcée. Vérifier les paramètres machine."
-    else:
-        return "faible",   "Machine en fonctionnement normal. Aucune action requise."
+def build_feature_vector(data: MechaPredictionRequest) -> np.ndarray:
+    return build_feature_matrix([data])
+
+
+def _exiger(*cles: str) -> None:
+    manquants = [k for k in cles if k not in models]
+    if manquants:
+        raise HTTPException(503, f"Modèles non chargés : {manquants}. Lancez model_training.py.")
+
+
+def _classifier(features: np.ndarray, clf_key: str, scaler_key: str) -> list[PredictionResponse]:
+    X = models[scaler_key].transform(features)
+    preds  = models[clf_key].predict(X)
+    probas = models[clf_key].predict_proba(X)[:, 1]
+    out = []
+    for pred, proba in zip(preds, probas):
+        niveau, action = regles.niveau_panne(float(proba))
+        out.append(PredictionResponse(
+            prediction=int(pred), probability=round(float(proba), 4),
+            risk_level=niveau, recommendation=action,
+        ))
+    return out
+
+
+def _rul(features: np.ndarray) -> list[RULResponse]:
+    ruls = models["reg_rul"].predict(models["scaler_rul"].transform(features))
+    out = []
+    for rul in ruls:
+        rul = float(max(0.0, rul))
+        niveau, action = regles.niveau_rul(rul)
+        out.append(RULResponse(estimated_rul_hours=round(rul, 2), risk_level=niveau, recommendation=action))
+    return out
+
+
+def _anomalie(features: np.ndarray) -> AnomalyResponse:
+    X = models["scaler_anomaly"].transform(features)
+    est_anomalie = bool(models["iso_forest"].predict(X)[0] == -1)    # -1 = anomalie
+    score = regles.score_anomalie_normalise(float(models["iso_forest"].score_samples(X)[0]))
+    niveau, action = regles.niveau_anomalie(est_anomalie, score)
+    return AnomalyResponse(
+        is_anomaly=est_anomalie, anomaly_score=round(score, 4),
+        risk_level=niveau, recommendation=action,
+    )
+
+
+def _contributions(clf_key: str, features_scaled: np.ndarray, prediction: int) -> tuple[np.ndarray, str]:
+    """Contributions de chaque feature à la probabilité de panne (classe 1)."""
+    clf = models[clf_key]
+    try:
+        import shap
+        cache_key = f"explainer_{clf_key}"
+        if cache_key not in models:
+            models[cache_key] = shap.TreeExplainer(clf)
+        sv = models[cache_key].shap_values(features_scaled)
+        if isinstance(sv, list):              # shap < 0.45 : une matrice par classe
+            contribs = np.asarray(sv[1])[0]
+        else:
+            sv = np.asarray(sv)               # shap >= 0.45 : (n, features[, classes])
+            contribs = sv[0, :, 1] if sv.ndim == 3 else sv[0]
+        return np.asarray(contribs, dtype=float), "shap"
+    except ImportError:
+        # Repli : importances globales orientées selon la prédiction
+        sign = 1 if prediction == 1 else -1
+        return clf.feature_importances_ * sign, "importance_globale"
+
+
+def _expliquer(data: MechaPredictionRequest, clf_key: str, scaler_key: str) -> ExplainResponse:
+    features = build_feature_vector(data)
+    resultat = _classifier(features, clf_key, scaler_key)[0]
+    contribs, methode = _contributions(
+        clf_key, models[scaler_key].transform(features), resultat.prediction
+    )
+    top = np.argsort(np.abs(contribs))[::-1][:3]
+    return ExplainResponse(
+        **resultat.model_dump(),
+        methode=methode,
+        top_features=[
+            FeatureContribution(
+                feature=FEATURE_NAMES[i],
+                value=round(float(features[0][i]), 3),
+                contribution=round(float(contribs[i]), 4),
+                direction="hausse_risque" if contribs[i] > 0 else "baisse_risque",
+            )
+            for i in top
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Endpoints — état et prédiction
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-async def health_check():
-    return {"status": "ok", "models_loaded": list(models.keys())}
+def health_check():
+    return {
+        "status": "ok",
+        "models_loaded": [k for k in models if not k.startswith("explainer_")],
+        "database": bool(DB_AVAILABLE and db.is_db_available()),
+    }
 
 
 @app.get("/model/info")
-async def model_info():
-    info = {"available_models": list(models.keys())}
+def model_info():
+    info = {"available_models": [k for k in models if not k.startswith("explainer_")]}
     results_path = MODELS_DIR / "training_results.json"
     if results_path.exists():
         with open(results_path, encoding="utf-8") as f:
@@ -209,168 +332,87 @@ async def model_info():
     return info
 
 
+@app.get("/config/regles")
+def config_regles():
+    """Règles métier actives : seuils, niveaux, déclenchement des alertes, fréquences."""
+    return regles.charger_regles()
+
+
 @app.post("/predict/panne", response_model=PredictionResponse)
-async def predict_panne(data: MechaPredictionRequest):
+def predict_panne(data: MechaPredictionRequest):
     """Prédit si la machine est actuellement en panne."""
-    if "clf_panne" not in models:
-        raise HTTPException(503, "Modèle en_panne non chargé. Lancez model_training.py.")
-
-    features        = build_feature_vector(data)
-    features_scaled = models["scaler_panne"].transform(features)
-    prediction      = int(models["clf_panne"].predict(features_scaled)[0])
-    probability     = float(models["clf_panne"].predict_proba(features_scaled)[0][1])
-    risk, reco      = get_risk_assessment(probability)
-
-    return PredictionResponse(
-        prediction=prediction,
-        probability=round(probability, 4),
-        risk_level=risk,
-        recommendation=reco,
-    )
+    _exiger("clf_panne", "scaler_panne")
+    return _classifier(build_feature_vector(data), "clf_panne", "scaler_panne")[0]
 
 
 @app.post("/predict/panne24h", response_model=PredictionResponse)
-async def predict_panne_24h(data: MechaPredictionRequest):
+def predict_panne_24h(data: MechaPredictionRequest):
     """Prédit si une panne surviendra dans les 24 heures."""
-    if "clf_24h" not in models:
-        raise HTTPException(503, "Modèle panne_24h non chargé. Lancez model_training.py.")
-
-    features        = build_feature_vector(data)
-    features_scaled = models["scaler_24h"].transform(features)
-    prediction      = int(models["clf_24h"].predict(features_scaled)[0])
-    probability     = float(models["clf_24h"].predict_proba(features_scaled)[0][1])
-    risk, reco      = get_risk_assessment(probability)
-
-    return PredictionResponse(
-        prediction=prediction,
-        probability=round(probability, 4),
-        risk_level=risk,
-        recommendation=reco,
-    )
+    _exiger("clf_24h", "scaler_24h")
+    return _classifier(build_feature_vector(data), "clf_24h", "scaler_24h")[0]
 
 
 @app.post("/predict/rul", response_model=RULResponse)
-async def predict_rul(data: MechaPredictionRequest):
+def predict_rul(data: MechaPredictionRequest):
     """Prédit le temps restant avant la prochaine défaillance (RUL)."""
-    if "reg_rul" not in models:
-        raise HTTPException(503, "Modèle RUL non chargé. Lancez model_training.py.")
-
-    features        = build_feature_vector(data)
-    features_scaled = models["scaler_rul"].transform(features)
-    rul             = float(max(0, models["reg_rul"].predict(features_scaled)[0]))
-
-    if rul < 6:
-        risk = "critique"
-        reco = "ARRÊT IMMÉDIAT. Maintenance urgente à planifier."
-    elif rul < 12:
-        risk = "élevé"
-        reco = "Maintenance à prévoir dans les prochaines heures."
-    elif rul < 24:
-        risk = "moyen"
-        reco = "Surveiller de près. Maintenance sous 24 h."
-    else:
-        risk = "faible"
-        reco = "Machine en état normal. Prochaine maintenance planifiée."
-
-    return RULResponse(
-        estimated_rul_hours=round(rul, 2),
-        risk_level=risk,
-        recommendation=reco,
-    )
+    _exiger("reg_rul", "scaler_rul")
+    return _rul(build_feature_vector(data))[0]
 
 
 @app.post("/predict/anomalie", response_model=AnomalyResponse)
-async def predict_anomalie(data: MechaPredictionRequest):
+def predict_anomalie(data: MechaPredictionRequest):
     """
     Détecte un comportement capteur atypique via Isolation Forest.
     Approche non supervisée — ne nécessite pas de labels de panne.
     Complémentaire aux classifieurs supervisés.
     """
-    if "iso_forest" not in models:
-        raise HTTPException(503, "Modèle Isolation Forest non chargé. Lancez model_training.py.")
+    _exiger("iso_forest", "scaler_anomaly")
+    return _anomalie(build_feature_vector(data))
 
-    features        = build_feature_vector(data)
-    features_scaled = models["scaler_anomaly"].transform(features)
 
-    pred  = models["iso_forest"].predict(features_scaled)[0]       # -1 = anomalie, +1 = normal
-    score = float(models["iso_forest"].score_samples(features_scaled)[0])
-
-    is_anomaly = pred == -1
-    # score_samples est négatif ; on normalise vers [0, 1] (1 = très anormal)
-    normalized = float(max(0.0, min(1.0, (-score - 0.3) / 0.4)))
-
-    if is_anomaly and normalized > 0.7:
-        risk = "anomalie"
-        reco = "Comportement capteur très inhabituel. Vérifier la machine immédiatement."
-    elif is_anomaly:
-        risk = "suspect"
-        reco = "Comportement légèrement atypique. Surveillance renforcée recommandée."
-    else:
-        risk = "normal"
-        reco = "Comportement capteur dans les normes habituelles."
-
-    return AnomalyResponse(
-        is_anomaly=is_anomaly,
-        anomaly_score=round(normalized, 4),
-        risk_level=risk,
-        recommendation=reco,
-    )
+@app.post("/predict/batch", response_model=BatchResponse)
+def predict_batch(req: BatchRequest):
+    """Panne 24 h (+ RUL si disponible) pour une liste de relevés (1 000 maximum)."""
+    _exiger("clf_24h", "scaler_24h")
+    features = build_feature_matrix(req.lignes)
+    pannes = _classifier(features, "clf_24h", "scaler_24h")
+    ruls = _rul(features) if "reg_rul" in models else [None] * len(pannes)
+    return BatchResponse(resultats=[BatchLigne(panne24h=p, rul=r) for p, r in zip(pannes, ruls)])
 
 
 @app.post("/predict/panne/explain", response_model=ExplainResponse)
-async def explain_panne(data: MechaPredictionRequest):
-    """
-    Explique les facteurs ayant conduit à la prédiction de panne.
-    Utilise SHAP TreeExplainer si disponible, sinon les importances globales RF.
-    """
-    if "clf_panne" not in models:
-        raise HTTPException(503, "Modèle en_panne non chargé. Lancez model_training.py.")
+def explain_panne(data: MechaPredictionRequest):
+    """Facteurs ayant conduit à la prédiction en_panne (SHAP TreeExplainer)."""
+    _exiger("clf_panne", "scaler_panne")
+    return _expliquer(data, "clf_panne", "scaler_panne")
 
-    features        = build_feature_vector(data)
-    features_scaled = models["scaler_panne"].transform(features)
-    prediction      = int(models["clf_panne"].predict(features_scaled)[0])
-    probability     = float(models["clf_panne"].predict_proba(features_scaled)[0][1])
-    risk, reco      = get_risk_assessment(probability)
 
-    try:
-        import shap
-        explainer   = shap.TreeExplainer(models["clf_panne"])
-        shap_values = explainer.shap_values(features_scaled)
-        contribs    = shap_values[1][0] if isinstance(shap_values, list) else shap_values[0]
-    except ImportError:
-        # Fallback : importances globales orientées selon la prédiction
-        sign    = 1 if prediction == 1 else -1
-        contribs = models["clf_panne"].feature_importances_ * sign
-
-    feat_values  = features[0]
-    top_indices  = np.argsort(np.abs(contribs))[::-1][:3]
-
-    top_features = [
-        FeatureContribution(
-            feature=FEATURE_NAMES[i],
-            value=round(float(feat_values[i]), 3),
-            contribution=round(float(contribs[i]), 4),
-            direction="hausse_risque" if contribs[i] > 0 else "baisse_risque",
-        )
-        for i in top_indices
-    ]
-
-    return ExplainResponse(
-        prediction=prediction,
-        probability=round(probability, 4),
-        risk_level=risk,
-        recommendation=reco,
-        top_features=top_features,
-    )
+@app.post("/predict/panne24h/explain", response_model=ExplainResponse)
+def explain_panne_24h(data: MechaPredictionRequest):
+    """Facteurs ayant conduit à la prédiction de panne dans les 24 h (SHAP TreeExplainer)."""
+    _exiger("clf_24h", "scaler_24h")
+    return _expliquer(data, "clf_24h", "scaler_24h")
 
 
 # ---------------------------------------------------------------------------
-# Webhook + Monitoring (simulation production avec PostgreSQL)
+# Webhook + alertes (simulation production avec PostgreSQL)
 # ---------------------------------------------------------------------------
 
 class WebhookSensorRequest(MechaPredictionRequest):
     """Étend la requête de prédiction avec l'identité physique de la machine."""
-    machine_id: str = Field(..., description="Identifiant unique de la machine (ex: USN-FR-01-M01)")
+    machine_id:  str = Field(..., description="Identifiant unique de la machine (ex: USN-FR-01-M01)")
+    measured_at: datetime | None = Field(
+        None, description="Horodatage de la mesure à la source (capteur / SCADA)"
+    )
+
+
+class AlertResponse(BaseModel):
+    id:          int
+    machine_id:  str
+    source:      str
+    niveau:      str
+    message:     str
+    notifiee:    bool
 
 
 class WebhookResponse(BaseModel):
@@ -380,29 +422,85 @@ class WebhookResponse(BaseModel):
     panne24h:      PredictionResponse
     rul:           RULResponse
     anomaly:       AnomalyResponse
+    alertes:       list[AlertResponse] = []
 
 
-@app.post("/webhook/sensor", response_model=WebhookResponse)
-async def webhook_sensor(data: WebhookSensorRequest):
-    """
-    Reçoit une lecture capteur, exécute les 3 inférences ML (panne24h, RUL, anomalie)
-    et persiste la lecture + la prédiction dans PostgreSQL.
-    """
+def _exiger_db() -> None:
     if not DB_AVAILABLE:
         raise HTTPException(503, "Base de données non disponible (DB_AVAILABLE=False).")
 
-    required_models = ["clf_24h", "scaler_24h", "reg_rul", "scaler_rul", "iso_forest", "scaler_anomaly"]
-    missing = [k for k in required_models if k not in models]
-    if missing:
-        raise HTTPException(503, f"Modèles ML manquants : {missing}")
+
+def notifier(alerte: dict) -> bool:
+    """
+    Journalise l'alerte et, si une URL est configurée, la pousse en POST JSON
+    (outil de ticketing, SCADA, messagerie…). Retourne True si la notification
+    externe a abouti.
+    """
+    cfg = regles.charger_regles()["alertes"]["notification"]
+    logger.warning("ALERTE %s — %s (%s) : %s",
+                   alerte["niveau"].upper(), alerte["machine_id"], alerte["source"], alerte["message"])
+    url = os.getenv("MECHA_ALERT_WEBHOOK_URL") or cfg.get("webhook_url")
+    if not url:
+        return False
+    try:
+        r = httpx.post(url, json=jsonable_encoder(alerte), timeout=float(cfg.get("timeout_s", 3)))
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.error("Notification de l'alerte %s échouée : %s", alerte["id"], exc)
+        return False
+    db.mark_alert_notified(alerte["id"])
+    return True
+
+
+def evaluer_alertes(data: WebhookSensorRequest, prediction_id: int,
+                    panne24h: PredictionResponse, rul: RULResponse,
+                    anomaly: AnomalyResponse) -> list[AlertResponse]:
+    """
+    Applique les règles d'alerte de config/regles_metier.yaml après chaque
+    prédiction : N lectures consécutives dans un niveau déclencheur, et
+    aucune alerte déjà ouverte pour la même machine et la même source.
+    """
+    creees = []
+    for source, resultat in (("panne24h", panne24h), ("anomalie", anomaly)):
+        n = regles.lectures_requises(source)
+        niveaux = db.get_recent_levels(data.machine_id, source, n)
+        if not regles.doit_alerter(source, niveaux):
+            continue
+        if db.has_open_alert(data.machine_id, source):
+            continue
+        alerte = db.insert_alert({
+            "prediction_id": prediction_id,
+            "machine_id":    data.machine_id,
+            "usine_id":      data.usine_id,
+            "type_machine":  data.type_machine,
+            "source":        source,
+            "niveau":        resultat.risk_level,
+            "probabilite":   panne24h.probability if source == "panne24h" else None,
+            "rul_hours":     rul.estimated_rul_hours,
+            "message":       f"Niveau « {resultat.risk_level} » sur {n} lectures consécutives. "
+                             f"{resultat.recommendation}",
+        })
+        alerte["notifiee"] = notifier(alerte)
+        creees.append(AlertResponse(**{k: alerte[k] for k in AlertResponse.model_fields}))
+    return creees
+
+
+@app.post("/webhook/sensor", response_model=WebhookResponse)
+def webhook_sensor(data: WebhookSensorRequest):
+    """
+    Reçoit une lecture capteur, exécute les 3 inférences ML (panne24h, RUL, anomalie),
+    persiste la lecture + la prédiction dans PostgreSQL et déclenche les alertes.
+    """
+    _exiger_db()
+    _exiger("clf_24h", "scaler_24h", "reg_rul", "scaler_rul", "iso_forest", "scaler_anomaly")
 
     features = build_feature_vector(data)   # shape (1, 9)
 
-    # --- Persister la lecture brute ---
     reading_payload = {
         "machine_id":           data.machine_id,
         "usine_id":             data.usine_id,
         "type_machine":         data.type_machine,
+        "measured_at":          data.measured_at,
         "temperature_C":        data.temperature_C,
         "vibration_mm_s":       data.vibration_mm_s,
         "courant_A":            data.courant_A,
@@ -412,62 +510,17 @@ async def webhook_sensor(data: WebhookSensorRequest):
         "h_depuis_maintenance": data.h_depuis_maintenance,
     }
     try:
-        reading_id = insert_reading(reading_payload)
+        reading_id = db.insert_reading(reading_payload)
     except Exception as exc:
         logger.error("Erreur insert_reading : %s", exc)
         raise HTTPException(500, "Erreur d'écriture en base de données.")
 
-    # --- Inférence panne24h ---
-    feat_24h = models["scaler_24h"].transform(features)
-    pred_24h = int(models["clf_24h"].predict(feat_24h)[0])
-    prob_24h = float(models["clf_24h"].predict_proba(feat_24h)[0][1])
-    risk_24h, reco_24h = get_risk_assessment(prob_24h)
-    panne24h_result = PredictionResponse(
-        prediction=pred_24h,
-        probability=round(prob_24h, 4),
-        risk_level=risk_24h,
-        recommendation=reco_24h,
-    )
+    panne24h_result = _classifier(features, "clf_24h", "scaler_24h")[0]
+    rul_result      = _rul(features)[0]
+    anomaly_result  = _anomalie(features)
 
-    # --- Inférence RUL ---
-    feat_rul = models["scaler_rul"].transform(features)
-    rul_val  = float(max(0, models["reg_rul"].predict(feat_rul)[0]))
-    if rul_val < 6:
-        rul_risk, rul_reco = "critique", "ARRET IMMEDIAT. Maintenance urgente à planifier."
-    elif rul_val < 12:
-        rul_risk, rul_reco = "élevé",    "Maintenance à prévoir dans les prochaines heures."
-    elif rul_val < 24:
-        rul_risk, rul_reco = "moyen",    "Surveiller de près. Maintenance sous 24 h."
-    else:
-        rul_risk, rul_reco = "faible",   "Machine en état normal. Prochaine maintenance planifiée."
-    rul_result = RULResponse(
-        estimated_rul_hours=round(rul_val, 2),
-        risk_level=rul_risk,
-        recommendation=rul_reco,
-    )
-
-    # --- Inférence anomalie ---
-    feat_ano   = models["scaler_anomaly"].transform(features)
-    pred_iso   = models["iso_forest"].predict(feat_ano)[0]
-    score_iso  = float(models["iso_forest"].score_samples(feat_ano)[0])
-    is_anomaly = pred_iso == -1
-    normalized = float(max(0.0, min(1.0, (-score_iso - 0.3) / 0.4)))
-    if is_anomaly and normalized > 0.7:
-        ano_risk, ano_reco = "anomalie", "Comportement capteur très inhabituel. Vérifier immédiatement."
-    elif is_anomaly:
-        ano_risk, ano_reco = "suspect",  "Comportement légèrement atypique. Surveillance renforcée."
-    else:
-        ano_risk, ano_reco = "normal",   "Comportement capteur dans les normes habituelles."
-    anomaly_result = AnomalyResponse(
-        is_anomaly=is_anomaly,
-        anomaly_score=round(normalized, 4),
-        risk_level=ano_risk,
-        recommendation=ano_reco,
-    )
-
-    # --- Persister la prédiction ---
     try:
-        prediction_id = insert_prediction(
+        prediction_id = db.insert_prediction(
             reading_id=reading_id,
             machine_id=data.machine_id,
             usine_id=data.usine_id,
@@ -480,6 +533,13 @@ async def webhook_sensor(data: WebhookSensorRequest):
         logger.error("Erreur insert_prediction : %s", exc)
         raise HTTPException(500, "Erreur d'écriture prédiction en base de données.")
 
+    # Une erreur sur les alertes ne doit pas faire perdre la prédiction enregistrée
+    try:
+        alertes = evaluer_alertes(data, prediction_id, panne24h_result, rul_result, anomaly_result)
+    except Exception as exc:
+        logger.error("Évaluation des alertes impossible : %s", exc)
+        alertes = []
+
     return WebhookResponse(
         reading_id=reading_id,
         prediction_id=prediction_id,
@@ -487,19 +547,24 @@ async def webhook_sensor(data: WebhookSensorRequest):
         panne24h=panne24h_result,
         rul=rul_result,
         anomaly=anomaly_result,
+        alertes=alertes,
     )
 
 
+def _serialiser_dates(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        for k, v in row.items():
+            if isinstance(v, datetime):
+                row[k] = v.isoformat()
+    return rows
+
+
 @app.get("/monitoring/recent")
-async def monitoring_recent(limit: int = 50):
+def monitoring_recent(limit: int = 50):
     """Retourne les N dernières prédictions depuis PostgreSQL."""
-    if not DB_AVAILABLE:
-        raise HTTPException(503, "Base de données non disponible.")
+    _exiger_db()
     try:
-        rows = get_recent_predictions(limit=min(limit, 200))
-        for row in rows:
-            if row.get("predicted_at"):
-                row["predicted_at"] = row["predicted_at"].isoformat()
+        rows = _serialiser_dates(db.get_recent_predictions(limit=min(limit, 200)))
         return {"predictions": rows, "count": len(rows)}
     except Exception as exc:
         logger.error("monitoring/recent : %s", exc)
@@ -507,19 +572,41 @@ async def monitoring_recent(limit: int = 50):
 
 
 @app.get("/monitoring/machines")
-async def monitoring_machines():
+def monitoring_machines():
     """Retourne la dernière prédiction par machine (DISTINCT ON)."""
-    if not DB_AVAILABLE:
-        raise HTTPException(503, "Base de données non disponible.")
+    _exiger_db()
     try:
-        rows = get_last_prediction_per_machine()
-        for row in rows:
-            if row.get("predicted_at"):
-                row["predicted_at"] = row["predicted_at"].isoformat()
+        rows = _serialiser_dates(db.get_last_prediction_per_machine())
         return {"machines": rows, "count": len(rows)}
     except Exception as exc:
         logger.error("monitoring/machines : %s", exc)
         raise HTTPException(500, "Erreur de lecture en base de données.")
+
+
+@app.get("/alertes")
+def lister_alertes(statut: Literal["ouverte", "acquittee"] | None = None, limit: int = 50):
+    """Alertes les plus récentes en premier (statut : ouverte / acquittee)."""
+    _exiger_db()
+    try:
+        rows = _serialiser_dates(db.get_alerts(statut=statut, limit=min(limit, 500)))
+        return {"alertes": rows, "count": len(rows)}
+    except Exception as exc:
+        logger.error("alertes : %s", exc)
+        raise HTTPException(500, "Erreur de lecture en base de données.")
+
+
+@app.post("/alertes/{alert_id}/acquitter")
+def acquitter_alerte(alert_id: int):
+    """Acquitte une alerte : la maintenance l'a prise en charge."""
+    _exiger_db()
+    try:
+        row = db.acknowledge_alert(alert_id)
+    except Exception as exc:
+        logger.error("acquittement : %s", exc)
+        raise HTTPException(500, "Erreur d'écriture en base de données.")
+    if row is None:
+        raise HTTPException(404, f"Alerte {alert_id} introuvable.")
+    return _serialiser_dates([row])[0]
 
 
 if __name__ == "__main__":

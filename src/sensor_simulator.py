@@ -1,13 +1,17 @@
 """
 Simulateur de capteurs IoT MECHA.
 
-Rejoue les lignes de mecha_dataset_full.csv vers le webhook /webhook/sensor
-de l'API, en simulant le comportement de 30 machines IoT en production.
+Rejoue les lignes BRUTES de mecha_dataset_full.csv vers le webhook
+/webhook/sensor de l'API, en simulant les 30 machines IoT en production :
+  - chaque relevé est envoyé avec son horodatage de mesure (measured_at) ;
+  - un relevé incomplet (perte de mesure) n'est pas transmis ;
+  - un relevé hors bornes physiques est transmis tel quel : l'API le rejette
+    (HTTP 422), comme le ferait un contrôle de plausibilité à l'ingestion.
 
 Variables d'environnement :
-  API_URL            (défaut : http://mecha-api:8000)
-  DATA_PATH          (défaut : /app/data/raw/mecha_dataset_full.csv)
-  SIMULATOR_DELAY    (défaut : 2.0 s entre chaque timestamp simulé)
+  API_URL             (défaut : http://mecha-api:8000)
+  DATA_PATH           (défaut : data/raw/mecha_dataset_full.csv)
+  SIMULATOR_DELAY     (défaut : frequences.simulateur_intervalle_s du fichier de règles)
   SIMULATOR_MAX_RETRY (défaut : 30 tentatives de connexion API au démarrage)
 """
 
@@ -20,6 +24,11 @@ from pathlib import Path
 import httpx
 import pandas as pd
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:          # exécution directe : python src/sensor_simulator.py
+    sys.path.insert(0, str(BASE_DIR))
+from src.regles import charger_regles  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SIMULATOR] %(message)s",
@@ -28,10 +37,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 API_URL    = os.getenv("API_URL",   "http://mecha-api:8000")
-DATA_PATH  = os.getenv("DATA_PATH", str(Path(__file__).resolve().parent.parent
-                                        / "data" / "raw" / "mecha_dataset_full.csv"))
-DELAY      = float(os.getenv("SIMULATOR_DELAY",     "2.0"))
-MAX_RETRY  = int(os.getenv("SIMULATOR_MAX_RETRY",   "30"))
+DATA_PATH  = os.getenv("DATA_PATH", str(BASE_DIR / "data" / "raw" / "mecha_dataset_full.csv"))
+DELAY      = float(os.getenv("SIMULATOR_DELAY")
+                   or charger_regles()["frequences"]["simulateur_intervalle_s"])
+MAX_RETRY  = int(os.getenv("SIMULATOR_MAX_RETRY", "30"))
+
+SENSOR_COLS = ["temperature_C", "vibration_mm_s", "courant_A", "pression_bar", "vitesse_tr_min"]
 
 # Types de machines valides (contrainte Pydantic de l'API)
 VALID_TYPES = {"CNC-Fraisage", "CNC-Tournage", "Découpe-Laser", "Centre-Usinage"}
@@ -54,15 +65,12 @@ def wait_for_api(base_url: str, max_attempts: int) -> None:
     sys.exit(1)
 
 
-def send_row(client: httpx.Client, row: pd.Series) -> bool:
-    """
-    Envoie une ligne CSV vers POST /webhook/sensor.
-    Retourne True si succès, False sinon.
-    """
-    payload = {
+def build_payload(row: pd.Series) -> dict:
+    return {
         "machine_id":           str(row["machine_id"]),
         "usine_id":             str(row["usine_id"]),
         "type_machine":         str(row["type_machine"]).strip(),
+        "measured_at":          pd.Timestamp(row["timestamp"]).isoformat(),
         "temperature_C":        float(row["temperature_C"]),
         "vibration_mm_s":       float(row["vibration_mm_s"]),
         "courant_A":            float(row["courant_A"]),
@@ -71,50 +79,48 @@ def send_row(client: httpx.Client, row: pd.Series) -> bool:
         "age_machine_h":        int(row["age_machine_h"]),
         "h_depuis_maintenance": int(row["h_depuis_maintenance"]),
     }
+
+
+def send_row(client: httpx.Client, row: pd.Series) -> str:
+    """
+    Envoie une ligne CSV vers POST /webhook/sensor.
+    Retourne « ok », « rejete » (contrôle de plausibilité de l'API) ou « erreur ».
+    """
     try:
-        r = client.post(f"{API_URL}/webhook/sensor", json=payload, timeout=10.0)
-        if r.status_code != 200:
-            logger.warning(
-                "  %s — HTTP %d : %s",
-                row["machine_id"], r.status_code, r.text[:120],
-            )
-            return False
-        return True
+        r = client.post(f"{API_URL}/webhook/sensor", json=build_payload(row), timeout=10.0)
     except httpx.RequestError as exc:
         logger.warning("  %s — Erreur réseau : %s", row["machine_id"], exc)
-        return False
+        return "erreur"
+    if r.status_code == 422:
+        logger.info("  %s — relevé rejeté (hors bornes physiques)", row["machine_id"])
+        return "rejete"
+    if r.status_code != 200:
+        logger.warning("  %s — HTTP %d : %s", row["machine_id"], r.status_code, r.text[:120])
+        return "erreur"
+    for alerte in r.json().get("alertes", []):
+        logger.warning("  ALERTE %s — %s : %s",
+                       alerte["niveau"].upper(), alerte["machine_id"], alerte["message"])
+    return "ok"
 
 
-def load_and_clean(path: str) -> pd.DataFrame:
-    """Charge le CSV et nettoie les valeurs hors bornes Pydantic."""
+def load_data(path: str) -> pd.DataFrame:
+    """Charge le CSV brut (sans nettoyage : c'est le rôle de l'API et de la préparation)."""
     logger.info("Chargement du dataset : %s", path)
     df = pd.read_csv(path, parse_dates=["timestamp"])
     logger.info("  %d lignes | %d timestamps uniques | %d machines",
                 len(df), df["timestamp"].nunique(), df["machine_id"].nunique())
 
-    # Filtrer les types/usines inconnus (ne doivent pas arriver avec ce dataset)
     before = len(df)
-    df = df[df["type_machine"].str.strip().isin(VALID_TYPES)]
-    df = df[df["usine_id"].isin(VALID_USINES)]
+    df = df[df["type_machine"].str.strip().isin(VALID_TYPES) & df["usine_id"].isin(VALID_USINES)]
     if len(df) < before:
         logger.warning("  %d lignes supprimées (type/usine inconnu)", before - len(df))
-
-    # Clamp des valeurs hors bornes de validation Pydantic
-    df["temperature_C"]  = df["temperature_C"].clip(upper=299.0)
-    df["vibration_mm_s"] = df["vibration_mm_s"].clip(upper=19.99)
-    df["courant_A"]      = df["courant_A"].clip(lower=0.0, upper=99.9)
-    df["pression_bar"]   = df["pression_bar"].clip(lower=0.0, upper=19.9)
-    df["vitesse_tr_min"] = df["vitesse_tr_min"].clip(lower=0.0, upper=2999.0)
-    df["age_machine_h"]  = df["age_machine_h"].clip(lower=0, upper=199999)
-    df["h_depuis_maintenance"] = df["h_depuis_maintenance"].clip(lower=0, upper=9999)
-
     return df
 
 
 def run_simulation(df: pd.DataFrame) -> None:
     """Boucle de simulation infinie sur les timestamps du CSV."""
-    timestamps = sorted(df["timestamp"].unique())
-    total      = len(timestamps)
+    groupes    = [g for _, g in df.groupby("timestamp", sort=True)]
+    total      = len(groupes)
     loop_count = 0
 
     with httpx.Client() as client:
@@ -122,12 +128,15 @@ def run_simulation(df: pd.DataFrame) -> None:
             loop_count += 1
             logger.info("=== Boucle %d — %d timestamps à envoyer ===", loop_count, total)
 
-            for i, ts in enumerate(timestamps, 1):
-                group = df[df["timestamp"] == ts]
-                ok    = sum(send_row(client, row) for _, row in group.iterrows())
+            for i, group in enumerate(groupes, 1):
+                complets = group.dropna(subset=SENSOR_COLS)
+                bilan = {"ok": 0, "rejete": 0, "erreur": 0}
+                for _, row in complets.iterrows():
+                    bilan[send_row(client, row)] += 1
                 logger.info(
-                    "[%d/%d] ts=%s  machines=%d  envois_ok=%d",
-                    i, total, ts, len(group), ok,
+                    "[%d/%d] ts=%s  machines=%d  ok=%d  rejetés=%d  non_transmis=%d  erreurs=%d",
+                    i, total, group["timestamp"].iloc[0], len(group), bilan["ok"],
+                    bilan["rejete"], len(group) - len(complets), bilan["erreur"],
                 )
                 time.sleep(DELAY)
 
@@ -142,7 +151,7 @@ def main() -> None:
 
     wait_for_api(API_URL, MAX_RETRY)
 
-    df = load_and_clean(DATA_PATH)
+    df = load_data(DATA_PATH)
     run_simulation(df)
 
 
