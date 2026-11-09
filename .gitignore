@@ -13,11 +13,13 @@ data/processed/*.csv
 models/*.joblib
 models/*.png
 models/training_results.json
+models/archive_ancien_pipeline/
 .pytest_cache/
 .mypy_cache/
 .claude/
-mecha_dataset_full.csv
-mecha_dataset_sample.csv
+# Doublons éventuels à la racine (le dataset de référence est data/raw/mecha_dataset_full.csv)
+/mecha_dataset_full.csv
+/mecha_dataset_sample.csv
 reference/mecha_dataset_full.csv
 reference/mecha_dataset_sample.csv
 archive (1)/
