@@ -1,0 +1,133 @@
+# =============================================================================
+# MECHA — Règles métier de la solution de maintenance prédictive
+# =============================================================================
+# Fichier de paramétrage applicatif, lu par :
+#   - src/data_preparation.py  (bornes capteurs, nettoyage)
+#   - src/model_training.py    (seuils pour l'évaluation des alertes)
+#   - src/api.py               (niveaux de risque, déclenchement des alertes)
+#   - src/dashboard.py         (couleurs des jauges, fréquence de rafraîchissement)
+#   - src/sensor_simulator.py  (fréquence d'envoi)
+#
+# Modifier une valeur ici change le comportement de toute la chaîne, sans
+# toucher au code. Redémarrer l'API et le dashboard après modification.
+# Chemin surchargeable par la variable d'environnement MECHA_REGLES.
+# =============================================================================
+
+version: 1
+
+# -----------------------------------------------------------------------------
+# 1. Capteurs : bornes physiques de plausibilité
+# -----------------------------------------------------------------------------
+# Une valeur hors bornes est considérée comme une erreur capteur :
+#   - à la préparation des données, elle est remplacée par une valeur manquante ;
+#   - à l'API, la requête est rejetée (HTTP 422).
+capteurs:
+  temperature_C:        {min: -20, max: 300,    unite: "°C"}
+  vibration_mm_s:       {min: 0,   max: 20,     unite: "mm/s"}
+  courant_A:            {min: 0,   max: 100,    unite: "A"}
+  pression_bar:         {min: 0,   max: 20,     unite: "bar"}
+  vitesse_tr_min:       {min: 0,   max: 3000,   unite: "tr/min"}
+  age_machine_h:        {min: 0,   max: 200000, unite: "h"}
+  h_depuis_maintenance: {min: 0,   max: 10000,  unite: "h"}
+
+# -----------------------------------------------------------------------------
+# 2. Qualité des données (préparation)
+# -----------------------------------------------------------------------------
+qualite_donnees:
+  # Une même valeur répétée pendant au moins N heures = capteur figé.
+  duree_min_capteur_fige_h: 6
+  # Un trou de mesure de N heures au plus est comblé par la dernière valeur
+  # connue (ce dont dispose aussi l'atelier en temps réel). Au-delà, la ligne
+  # est écartée de l'apprentissage.
+  imputation_max_h: 3
+
+# -----------------------------------------------------------------------------
+# 3. Niveaux de risque — probabilité de panne dans les 24 h
+# -----------------------------------------------------------------------------
+# Ordre décroissant de seuil. Une probabilité égale au seuil appartient au
+# niveau. Le dernier niveau doit avoir seuil_min: 0.
+niveaux_risque_panne:
+  - niveau: critique
+    seuil_min: 0.80
+    couleur: "#dc3545"
+    action: "ARRÊT IMMÉDIAT recommandé. Intervention urgente requise."
+  - niveau: élevé
+    seuil_min: 0.50
+    couleur: "#fd7e14"
+    action: "Planifier une maintenance préventive dans les prochaines heures."
+  - niveau: moyen
+    seuil_min: 0.30
+    couleur: "#ffc107"
+    action: "Surveillance renforcée. Vérifier les paramètres machine."
+  - niveau: faible
+    seuil_min: 0.0
+    couleur: "#28a745"
+    action: "Machine en fonctionnement normal. Aucune action requise."
+
+# -----------------------------------------------------------------------------
+# 4. Niveaux de risque — temps restant avant défaillance (RUL, en heures)
+# -----------------------------------------------------------------------------
+# Le RUL est un ordre de grandeur (erreur moyenne ~ plusieurs dizaines
+# d'heures) : il sert à prioriser, pas à déclencher une alerte.
+niveaux_risque_rul:
+  - niveau: critique
+    rul_max_h: 6
+    action: "Défaillance estimée très proche. Croiser avec le risque de panne 24 h et planifier une intervention urgente."
+  - niveau: élevé
+    rul_max_h: 12
+    action: "Défaillance estimée dans les prochaines heures. Croiser avec le risque de panne 24 h."
+  - niveau: moyen
+    rul_max_h: 24
+    action: "Défaillance estimée sous 24 h. Surveiller de près."
+  - niveau: faible
+    rul_max_h: null          # au-delà de tous les seuils précédents
+    action: "Pas de défaillance estimée à court terme (estimation indicative : se fier au risque de panne 24 h et aux alertes)."
+
+# -----------------------------------------------------------------------------
+# 5. Détection d'anomalies (Isolation Forest)
+# -----------------------------------------------------------------------------
+anomalie:
+  # Transformation du score brut (score_samples, négatif) en score [0, 1] :
+  #   score = clip((-score_brut - decalage) / echelle, 0, 1)
+  normalisation: {decalage: 0.3, echelle: 0.4}
+  # Au-dessus de ce score, une anomalie détectée passe de « suspect » à « anomalie ».
+  seuil_anomalie_forte: 0.7
+  actions:
+    anomalie: "Comportement capteur très inhabituel. Vérifier la machine immédiatement."
+    suspect:  "Comportement légèrement atypique. Surveillance renforcée recommandée."
+    normal:   "Comportement capteur dans les normes habituelles."
+
+# -----------------------------------------------------------------------------
+# 6. Déclenchement des alertes
+# -----------------------------------------------------------------------------
+# Une alerte est créée quand les N dernières lectures d'une machine sont toutes
+# dans un des niveaux listés. Exiger plusieurs lectures consécutives filtre les
+# pics isolés et réduit fortement les fausses alertes (voir le rapport de
+# validation, section « règle d'alerte »).
+# Tant qu'une alerte est ouverte pour une machine et une source, aucune
+# nouvelle alerte n'est créée : elle doit d'abord être acquittée.
+alertes:
+  panne24h:
+    niveaux: [critique]
+    lectures_consecutives: 3
+  anomalie:
+    niveaux: [anomalie]
+    lectures_consecutives: 3
+  notification:
+    # URL appelée en POST (JSON) à chaque nouvelle alerte : outil de ticketing,
+    # SCADA, messagerie… Vide = alerte journalisée et visible dans le dashboard.
+    webhook_url: ""
+    timeout_s: 3
+
+# -----------------------------------------------------------------------------
+# 7. Fréquences de mise à jour
+# -----------------------------------------------------------------------------
+frequences:
+  # Production : un relevé capteur par heure et par machine.
+  releve_capteurs: "1 h"
+  # Simulation : secondes réelles entre deux heures simulées.
+  simulateur_intervalle_s: 2.0
+  # Rafraîchissement automatique de la page Monitoring.
+  dashboard_rafraichissement_s: 5
+  # Ré-entraînement des modèles avec les nouvelles données.
+  reentrainement_modeles: "trimestriel"
